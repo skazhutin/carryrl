@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local experiment outputs; agent documentation lives in the three root Markdown files.
+runs/
+.DS_Store
+.env.*

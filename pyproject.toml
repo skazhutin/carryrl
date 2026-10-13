@@ -1,0 +1,49 @@
+[project]
+name = "carryrl"
+version = "0.1.0"
+description = "Screen-based game learning experiments on macOS"
+readme = "SPEC.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "gymnasium>=1.2,<2",
+    "matplotlib>=3.8,<4",
+    "numpy>=2,<3",
+    "pillow>=11,<13",
+    "pygame>=2.6,<3",
+    "stable-baselines3>=2.9,<3",
+    "torch>=2.8,<3",
+    "transformers>=4.48,<6",
+]
+
+[project.scripts]
+carryrl = "carryrl.cli:main"
+carryrl-benchmark = "carryrl.benchmark:main"
+carryrl-monitor = "carryrl.dashboard.tensorboard:main"
+
+[project.optional-dependencies]
+monitor = [
+    "tensorboard>=2.20,<3",
+]
+mlx = [
+    "mlx>=0.32.3,<0.33",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryrl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

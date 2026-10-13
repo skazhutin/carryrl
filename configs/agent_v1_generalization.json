@@ -1,0 +1,143 @@
+{
+  "seed": 0,
+  "device": "cpu",
+  "agent": {
+    "pretrained": true,
+    "image_size": 224,
+    "width": 256,
+    "layers": 4,
+    "heads": 4,
+    "spatial_tokens": 16,
+    "memory_tokens": 8,
+    "segment_length": 64,
+    "text_encoder": "multilingual_e5_small",
+    "instruction_max_tokens": 512
+  },
+  "tasks": [
+    "navigation",
+    "reaction",
+    "mouse",
+    "memory",
+    "timing",
+    "platforming",
+    "steering",
+    "camera",
+    "interaction",
+    "causality",
+    "key_door",
+    "goal_choice",
+    "hazards",
+    "shooting",
+    "ui",
+    "chain"
+  ],
+  "total_rollouts": 32,
+  "episodes_per_task": 2,
+  "max_episode_steps": 80,
+  "env_image_size": 96,
+  "n_epochs": 3,
+  "learning_rate": 0.0002,
+  "weight_decay": 0.01,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "value_coef": 0.1,
+  "entropy_coef": 0.0001,
+  "max_grad_norm": 0.5,
+  "eval_episodes_per_task": 2,
+  "eval_every_rollouts": 4,
+  "torch_threads": 2,
+  "max_wall_seconds": 3600,
+  "reward_bootstrap_episodes_per_task": 8,
+  "reward_validation_episodes_per_task": 2,
+  "reward_epochs": 40,
+  "reward_confidence_threshold": 0.6,
+  "motor_initialization": "balanced",
+  "ppo_minibatch_episodes": 4,
+  "ppo_task_balance": true,
+  "target_kl": 0.02,
+  "eval_stochastic": false,
+  "eval_seed": 80001,
+  "eval_all_levels": false,
+  "evaluate_initial": true,
+  "task_episode_multipliers": {
+    "navigation": 4,
+    "reaction": 3,
+    "mouse": 4,
+    "ui": 3
+  },
+  "curriculum_difficulty": 1.0,
+  "curriculum_warmup_rollouts": 0,
+  "visual_config": null,
+  "reward_model_mode": "screen_v2",
+  "reward_checkpoint": "runs/reward_screen16_20261008_r2/reward_checkpoint.pt",
+  "vision_cache_frames": 128,
+  "episode_instructions": {
+    "navigation": [
+      "Доберись до зелёного выхода в лабиринте, обходя стены. Двигайся клавишами WASD или стрелками.",
+      "Reach the green exit through the maze. Use WASD or arrow keys to move; walls block movement."
+    ],
+    "reaction": [
+      "Подставляй платформу под падающий мяч, чтобы поймать его. A и D или стрелки влево и вправо двигают платформу. Не пропускай мяч.",
+      "Catch the falling ball with the paddle. Move the paddle left and right with A/D or arrow keys. Avoid missing the ball."
+    ],
+    "mouse": [
+      "Наведи игровой курсор на круглую цель и нажми левую кнопку мыши. Движение мыши двигает курсор. Отпускай кнопку между кликами; попадания открывают следующие цели.",
+      "Move the cursor onto the round target, then click the left mouse button. Release the button between clicks. Hit each target that appears."
+    ],
+    "memory": [
+      "Запомни дверь, подсвеченную в начале. Пока написано Wait, движение заблокировано. Когда появится Choose, выбери запомненную дверь клавишами A/D или стрелками влево/вправо.",
+      "Remember which door is highlighted at the start. Movement is blocked during Wait. At Choose, move to that remembered door using A/D or left/right arrows."
+    ],
+    "timing": [
+      "Пролетай через просветы движущихся препятствий. Короткое нажатие пробела подбрасывает персонажа. Отпускай пробел перед следующим взмахом; не касайся препятствий и границ.",
+      "Fly through the gaps in moving obstacles. Tap Space to flap upward and release it before the next flap. Avoid obstacles and screen boundaries."
+    ],
+    "platforming": [
+      "Доберись до флажка справа, перепрыгивая препятствия. A/D или стрелки влево/вправо двигают персонажа. Пробел запускает прыжок с земли; отпускай его между прыжками.",
+      "Reach the flag on the right by jumping over obstacles. Move with A/D or left/right arrows. Tap Space while on the ground to jump, then release it."
+    ],
+    "steering": [
+      "Доедь до конца извилистой дороги, удерживая машинку на ней. Машинка едет вперёд сама. A/D или стрелки влево/вправо управляют рулём; учитывай инерцию.",
+      "Stay on the winding road until the finish. Forward motion is automatic. Steer with A/D or left/right arrows and account for steering inertia."
+    ],
+    "camera": [
+      "Подойди к двери и выровняй камеру так, чтобы дверь оказалась по центру. WASD перемещают тебя, мышь поворачивает и наклоняет камеру. Одного поворота камеры недостаточно: нужно подойти.",
+      "Approach the door and center it in the camera view. WASD controls movement and the mouse controls camera yaw and pitch. Turning alone is insufficient; move close to the door."
+    ],
+    "interaction": [
+      "Подойди к предмету, нажми E, затем отнеси его к площадке и снова нажми E. Движение — WASD или стрелки. Отпускай E между взаимодействиями.",
+      "Move to the item and press E to pick it up, then move to the use area and press E again. Move with WASD or arrows; release E between interactions."
+    ],
+    "causality": [
+      "Подойди к кнопке и нажми E, чтобы открыть дверь. Затем пройди к выходу через открытый проход. Движение — WASD или стрелки; избегай красной опасной клетки.",
+      "Approach the button and press E to open the door. Then go through the passage to the exit. Move with WASD or arrows and avoid the red hazard."
+    ],
+    "key_door": [
+      "Найди ключ и подбери его нажатием E рядом с ним. Вернись к двери, отпусти и снова нажми E, затем дойди до выхода. Движение — WASD или стрелки.",
+      "Find the key and press E near it to pick it up. Return to the door, release and press E again to unlock it, then reach the exit. Move with WASD or arrows."
+    ],
+    "goal_choice": [
+      "Выбери цель с учётом награды и риска. Белые точки рядом с целями показывают их ценность. Двигайся WASD или стрелками и избегай охранника.",
+      "Choose a goal based on its reward and risk. White dots next to goals show their value. Move with WASD or arrow keys and avoid the guard."
+    ],
+    "hazards": [
+      "Дойди до выхода, обходя ловушки и патрулирующего врага. WASD или стрелки управляют движением. Контакт с красными клетками или врагом завершает игру поражением.",
+      "Reach the exit while avoiding traps and the patrolling enemy. Move with WASD or arrows. Touching a red trap or the enemy causes failure."
+    ],
+    "shooting": [
+      "Подойди к врагу на расстояние выстрела, наведи прицел и стреляй левой кнопкой мыши. WASD — движение, мышь — прицел. Число промахов ограничено; отпускай кнопку между выстрелами.",
+      "Move within firing range of the enemy, aim with the mouse, and fire with the left mouse button. WASD moves you. Misses are limited; release the button between shots."
+    ],
+    "ui": [
+      "Нажми Tab, чтобы открыть инвентарь. Стрелками выбери предмет цвета образца над меню, нажми Enter для подтверждения и Escape для закрытия. Отпускай клавиши между нажатиями.",
+      "Press Tab to open the inventory. Use arrow keys to select the item matching the color sample above the menu, press Enter to confirm, then Escape to close. Release keys between presses."
+    ],
+    "chain": [
+      "Выполни цепочку: подбери ключ, включи переключатель, открой дверь и дойди до выхода. WASD или стрелки — движение. Нажимай и отпускай E рядом с каждым объектом. Избегай опасностей.",
+      "Complete the sequence: collect the key, activate the switch, open the door, then reach the exit. Move with WASD or arrows; press and release E near each object. Avoid hazards."
+    ]
+  },
+  "training_backend": "mlx",
+  "level_bank_seed": 20261008
+}
