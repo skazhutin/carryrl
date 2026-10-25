@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from carryrl.agent.actions import MOUSE_BINS, PhysicalAction
+from carryrl.envs.curriculum import constructor_parameters
 
 HUD_HEIGHT = 28
 BACKGROUND = (31, 38, 52)
@@ -99,7 +100,7 @@ class TimingGame(_Game):
         self.y, self.velocity = float(level["start_y"]), 0.0
         self.pipes = [float(level["pipe_x"] + i * level["spacing"]) for i in range(3)]
         self.gaps = list(level["gaps"])
-        self.required_pipes = level.get("required_pipes", 3)
+        self.required_pipes = constructor_parameters("timing", level)["required_pipes"]
         self.pipes = self.pipes[:self.required_pipes]
         self.gaps = self.gaps[:self.required_pipes]
         self.gap_height, self.speed = level["gap_height"], level["speed"]
@@ -218,7 +219,7 @@ class SteeringGame(_Game):
         super().__init__(level, image_size)
         self.centers = list(level["centers"])
         self.road_width, self.speed = level["width"], level["speed"]
-        self.required_progress = level.get("required_progress", 72)
+        self.required_progress = constructor_parameters("steering", level)["required_progress"]
         self.x, self.velocity, self.progress = float(self.centers[0]), 0.0, 0.0
 
     def center(self, progress: float) -> float:
@@ -276,6 +277,7 @@ class CameraGame(_Game):
         self.position = np.zeros(2)
         self.yaw, self.pitch = level["bearing"] + level["yaw_error"], level["pitch"]
         self.difficulty = level.get("difficulty", 1.0)
+        self._tolerances = constructor_parameters("camera", level)
         self._aimed, self._approach = False, 0
 
     def _bearing(self) -> float:
@@ -283,8 +285,8 @@ class CameraGame(_Game):
         return _angle(math.atan2(relative[1], relative[0]) - self.yaw)
 
     def _aligned(self) -> bool:
-        return (abs(self._bearing()) <= 0.12 + 0.04 * (1 - self.difficulty)
-                and abs(self.pitch) <= 0.08 + 0.02 * (1 - self.difficulty))
+        return (abs(self._bearing()) <= self._tolerances["yaw_tolerance"]
+                and abs(self.pitch) <= self._tolerances["pitch_tolerance"])
 
     def step(self, action: PhysicalAction):
         if not self._tick(action):

@@ -92,6 +92,9 @@ def _parameter_shapes(config: AgentConfig) -> dict[str, tuple[int, ...]]:
                         ("dx", len(MOUSE_BINS)), ("dy", len(MOUSE_BINS))):
         shapes[f"decoder.{name}_embedding.weight"] = (count, width)
         linear(f"decoder.{name}_head", width, count)
+    if config.motor_version == "motor_v2":
+        shapes["decoder.motion_embedding.weight"] = (4, width)
+        linear("decoder.motion_head", width, 4)
     linear("decoder.wheel_head", width, len(WHEEL_BINS))
     linear("value_head", width, 1)
     if config.text_encoder != "none":
@@ -173,7 +176,7 @@ class MLXPolicy(nn.Module):
     def _mlp(self, x, name):
         return self._linear(nn.gelu(self._linear(x, name + ".0")), name + ".2")
 
-    def _attention(self, queries, keys, values, name):
+    def _attention(self, queries, keys, values, name, key_padding_mask=None):
         width, heads = self.config.width, self.config.heads
         packed = self.weights[name + ".in_proj_weight"]
         bias = self.weights[name + ".in_proj_bias"]
@@ -183,12 +186,48 @@ class MLXPolicy(nn.Module):
             x = tokens @ packed[offset:offset + width].T + bias[offset:offset + width]
             projected.append(x.reshape(x.shape[0], x.shape[1], heads, width // heads)
                              .transpose(0, 2, 1, 3))
+        # SDPA takes additive masks; Torch key padding uses True for exclusion.
+        mask = (None if key_padding_mask is None else
+                mx.where(key_padding_mask[:, None, None, :], -float("inf"), 0.0))
         attended = mx.fast.scaled_dot_product_attention(
-            *projected, scale=(width // heads) ** -0.5,
+            *projected, scale=(width // heads) ** -0.5, mask=mask,
         ).transpose(0, 2, 1, 3).reshape(queries.shape[0], queries.shape[1], width)
         return self._linear(attended, name + ".out_proj")
 
-    def _spatial_summary(self, patches, previous, instruction_context):
+    def _prepare_screen_text(self, features, count):
+        if features is None:
+            return None, None
+        if len(features) != count:
+            raise ValueError("screen text features must match the complete episode")
+        frames = []
+        for feature in features:
+            if feature is None:
+                frames.append(None)
+                continue
+            feature = to_mlx(feature)
+            if feature.ndim != 2 or feature.shape[-1] != 384:
+                raise ValueError("screen text features must have shape [tokens, 384]")
+            if not bool(mx.all(mx.isfinite(feature)).item()):
+                raise ValueError("screen text features must be finite")
+            frames.append(feature)
+        maximum = max((frame.shape[0] for frame in frames if frame is not None), default=0)
+        if maximum == 0:
+            return None, None
+        if self.config.text_encoder == "none":
+            raise ValueError("screen text features require an enabled text encoder")
+        padded, masks = [], []
+        for frame in frames:
+            length = 0 if frame is None else frame.shape[0]
+            padded.append(mx.zeros((maximum, 384)) if length == 0 else
+                          mx.pad(frame, ((0, maximum - length), (0, 0))))
+            masks.append(mx.arange(maximum) >= length)
+        text = mx.stack(padded)
+        padding = mx.concatenate((mx.zeros((count, self.config.spatial_tokens), dtype=mx.bool_),
+                                  mx.stack(masks)), axis=1)
+        return text, padding
+
+    def _spatial_summary(self, patches, previous, instruction_context,
+                         screen_text_features=None, key_padding_mask=None):
         side = isqrt(patches.shape[1])
         if side == 0 or side * side != patches.shape[1]:
             raise ValueError("patch count must form a square image grid")
@@ -207,9 +246,13 @@ class MLXPolicy(nn.Module):
                                                name + ".attention")
             spatial = spatial + self._mlp(self._norm(spatial, name + ".mlp_norm"), name + ".mlp")
         spatial = self._norm(spatial, "resampler.output_norm")
+        if screen_text_features is not None:
+            spatial = mx.concatenate((spatial, self._linear(
+                screen_text_features, "instruction_projection")), axis=1)
         query = mx.broadcast_to(self.weights["summary_query"],
                                 (len(previous), 1, self.config.width))
-        summary = self._attention(query, spatial, spatial, "summary_attention")[:, 0]
+        summary = self._attention(query, spatial, spatial, "summary_attention",
+                                  key_padding_mask)[:, 0]
         previous_features = mx.array([
             [*(float(key in action.keys) for key in KEY_VOCAB),
              *(float(button in action.mouse_buttons) for button in MOUSE_BUTTONS),
@@ -284,7 +327,7 @@ class MLXPolicy(nn.Module):
         entropy = -mx.sum(mx.exp(log_probs) * safe_log_probs, axis=-1)
         return selected, entropy
 
-    def _decode(self, features, actions, trace=None):
+    def _decode(self, features, actions, trace=None, previous_actions=None):
         state = mx.tanh(self._linear(features, "decoder.context"))
         count = len(actions)
         logp, entropy = mx.zeros((count,)), mx.zeros((count,))
@@ -296,9 +339,17 @@ class MLXPolicy(nn.Module):
             permitted = (mx.arange(eos)[None] > last[:, None]) & active[:, None]
             mask = mx.concatenate((permitted, mx.ones((count, 1), dtype=mx.bool_)), axis=1)
             logits = self._linear(state, "decoder.key_head")
-            if self.motor_initialization == "balanced":
-                prior = mx.concatenate((mx.zeros((count, eos)),
-                                        ((last >= 0).astype(mx.float32) * 3.5)[:, None]), axis=1)
+            if self.motor_initialization == "balanced" or self.config.motor_version == "motor_v2":
+                bonus = 0.5 if self.config.motor_version == "motor_v2" else 3.5
+                persistence = mx.zeros((count, eos))
+                if self.config.motor_version == "motor_v2" and previous_actions is not None:
+                    movement = {"w", "a", "s", "d", "up", "down", "left", "right"}
+                    persistence = mx.array([
+                        [1.5 if key in previous.keys and key in movement else 0.0
+                         for key in KEY_VOCAB] for previous in previous_actions
+                    ])
+                prior = mx.concatenate((persistence,
+                                        ((last >= 0).astype(mx.float32) * bonus)[:, None]), axis=1)
                 logits = logits + prior
             logits = mx.where(mask, logits, -float("inf"))
             if trace is not None:
@@ -311,6 +362,8 @@ class MLXPolicy(nn.Module):
             state = mx.where(active[:, None], following, state)
             has_key = active & (picked != eos)
             last, active = mx.where(has_key, picked, last), has_key
+        if self.config.motor_version == "motor_v2":
+            return self._motion_v2(state, actions, logp, entropy, trace)
         components = (
             ("mouse", [sum(1 << bit for bit, button in enumerate(MOUSE_BUTTONS)
                            if button in action.mouse_buttons) for action in actions]),
@@ -332,9 +385,39 @@ class MLXPolicy(nn.Module):
                 state = self._gru(self.weights[f"decoder.{name}_embedding.weight"][picked], state)
         return logp, entropy
 
+    def _motion_v2(self, state, actions, logp, entropy, trace):
+        count = len(actions)
+        all_rows = mx.ones((count,), dtype=mx.bool_)
+
+        def component(logits, picked):
+            nonlocal logp, entropy
+            part_logp, part_entropy = self._categorical(logits, picked)
+            logp, entropy = logp + part_logp, entropy + part_entropy
+            if trace is not None:
+                trace.append((logits - mx.logsumexp(logits, axis=-1, keepdims=True), all_rows))
+
+        gate = mx.array([int(action.dx != 0) + 2 * int(action.dy != 0) for action in actions])
+        component(self._linear(state, "decoder.motion_head"), gate)
+        state = self._gru(self.weights["decoder.motion_embedding.weight"][gate], state)
+        bins = mx.array(MOUSE_BINS)
+        for name, bit in (("dx", 1), ("dy", 2)):
+            enabled = (gate & bit) != 0
+            support = mx.where(enabled[:, None], bins[None] != 0, bins[None] == 0)
+            logits = mx.where(support, self._linear(state, f"decoder.{name}_head"), -float("inf"))
+            picked = mx.array([MOUSE_BINS.index(getattr(action, name)) for action in actions])
+            component(logits, picked)
+            state = self._gru(self.weights[f"decoder.{name}_embedding.weight"][picked], state)
+        buttons = mx.array([sum(1 << bit for bit, button in enumerate(MOUSE_BUTTONS)
+                                if button in action.mouse_buttons) for action in actions])
+        component(self._linear(state, "decoder.mouse_head"), buttons)
+        state = self._gru(self.weights["decoder.mouse_embedding.weight"][buttons], state)
+        component(self._linear(state, "decoder.wheel_head"),
+                  mx.array([WHEEL_BINS.index(action.wheel) for action in actions]))
+        return logp, entropy
+
     def evaluate_episode(self, patches, actions: Sequence[PhysicalAction], *,
                          instruction_features=None, executed_actions=None,
-                         return_decoder_trace=False) -> dict:
+                         return_decoder_trace=False, screen_text_features=None) -> dict:
         """Differentiate a full episode, including every cross-segment memory write."""
         if not actions or any(not isinstance(action, PhysicalAction) for action in actions):
             raise ValueError("a nonempty episode requires PhysicalAction entries")
@@ -353,21 +436,27 @@ class MLXPolicy(nn.Module):
             if feature.shape != (384,):
                 raise ValueError("instruction features must have shape [384]")
             context = self._linear(feature, "instruction_projection")
+        text, padding = self._prepare_screen_text(screen_text_features, len(actions))
         spatial, summary = self._spatial_summary(
-            patches, [PhysicalAction(), *executed[:-1]], context,
+            patches, [PhysicalAction(), *executed[:-1]], context, text, padding,
         )
         states = self._temporal(summary)
-        actor = states + self._attention(states[:, None], spatial, spatial, "actor_attention")[:, 0]
+        actor = states + self._attention(states[:, None], spatial, spatial,
+                                         "actor_attention", padding)[:, 0]
         if context is not None:
             actor = actor + context
         trace = [] if return_decoder_trace else None
-        logp, entropy = self._decode(self._norm(actor, "actor_norm"), actions, trace)
+        logp, entropy = self._decode(
+            self._norm(actor, "actor_norm"), actions, trace, [PhysicalAction(), *executed[:-1]],
+        )
         result = {"log_prob": logp, "entropy": entropy,
                   "value": self._linear(states, "value_head")[:, 0]}
         if trace is not None:
             result["decoder_trace"] = trace
         return result
 
-    def __call__(self, patches, actions, *, instruction_features=None, executed_actions=None):
+    def __call__(self, patches, actions, *, instruction_features=None, executed_actions=None,
+                 screen_text_features=None):
         return self.evaluate_episode(patches, actions, instruction_features=instruction_features,
-                                     executed_actions=executed_actions)
+                                     executed_actions=executed_actions,
+                                     screen_text_features=screen_text_features)

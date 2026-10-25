@@ -40,6 +40,8 @@ packages = ["src/carryrl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 
 [tool.ruff]
 target-version = "py312"

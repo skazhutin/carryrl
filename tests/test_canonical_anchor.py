@@ -11,8 +11,11 @@ from test_imitation import make_agent
 from carryrl.agent.actions import KEY_VOCAB, PhysicalAction
 from carryrl.training.imitation import (
     CORRECTION_SOURCE,
+    MEMORY_COUNTERPART_SOURCE,
     _canonical_anchor_parent,
+    _episode_nlls,
     augment_demonstrations,
+    collect_memory_cue_counterparts,
     collect_native_scripted_demonstrations,
     collect_scripted_demonstrations,
     teacher_prefix_conditional_kl,
@@ -101,6 +104,161 @@ def test_zero_coefficient_exact_parameter_and_objective_parity():
         assert first["total_objective"] == first["bc_objective"]
 
 
+def correction(episode):
+    return replace(episode, source=CORRECTION_SOURCE,
+        executed_actions=tuple(PhysicalAction(keys=("left",)) for _ in episode.actions),
+        expert_probability=.5, terminated=True, truncated=False, quality=None, quality_source=None)
+
+
+@pytest.mark.parametrize("exclude", [False, True])
+def test_correction_mask_preserves_pre_mask_denominator_bc_and_sampling(monkeypatch, exclude):
+    import carryrl.training.imitation as module
+
+    dataset, features = data_and_features()
+    dataset.add_episode(correction(dataset.episodes[0]))
+    memory = collect_scripted_demonstrations(1, tasks=("memory",), difficulty=1,
+                                             level_bank_seed=20261008)
+    dataset.extend(collect_memory_cue_counterparts(memory, max_pairs=1))
+    assert dataset.episodes[-1].source == MEMORY_COUNTERPART_SOURCE
+    dataset.extend(augment_demonstrations(dataset, copies_per_episode=1))
+    features.update({index: torch.randn(4, 384) for index in range(len(dataset.frames))})
+    before = deepcopy(dataset.provenance())
+    monkeypatch.setattr(module, "teacher_prefix_conditional_kl",
+                        lambda parent, student: student[0][0].exp().sum() * 0 + 2.0)
+    observations, agents = [], [make_agent(), make_agent()]
+    for agent, options in zip(agents, ({}, {"canonical_anchor_exclude_corrections": exclude}),
+                              strict=True):
+        requests, updates = [], []
+
+        def provide(index):
+            requests.append(index)
+            return features[index]
+
+        result = train_imitation(agent, dataset, canonical_anchor_coefficient=3,
+            canonical_replay_weight=4, minibatch_episodes=len(dataset.episodes),
+            epochs=2, feature_provider=provide, on_update=updates.append, **options)
+        observations.append((result, requests, updates))
+    base, masked = observations
+    assert base[1] == masked[1]
+    assert dataset.provenance() == before
+    assert base[0]["replay_weighting"] == masked[0]["replay_weighting"]
+    assert base[0]["optimizer_steps"] == masked[0]["optimizer_steps"] == 2
+    expected = 4 / 3 if exclude else 2
+    for original, row in zip(base[2], masked[2], strict=True):
+        assert original["tasks"] == row["tasks"]
+        assert row["bc_objective"] == original["bc_objective"]
+        assert row["anchor_eligible_episodes"] == (2 if exclude else 3)
+        assert row["anchor_kl"] == pytest.approx(expected)
+        assert row["total_objective"] == pytest.approx(row["bc_objective"] + 3 * expected)
+    assert masked[0]["history"][0]["anchor_kl"] == pytest.approx(expected)
+    assert masked[0]["history"][0]["anchor_eligible_episodes"] == (2 if exclude else 3)
+    summary = masked[0]["canonical_anchor"]
+    assert summary["exclude_corrections"] is exclude
+    assert summary["eligible_episodes"] == (2 if exclude else 3)
+    assert summary["normalization_eligible_episodes"] == 3
+    assert summary["excluded_correction_episodes"] == int(exclude)
+    for p, q in zip(agents[0].parameters(), agents[1].parameters(), strict=True):
+        torch.testing.assert_close(p, q, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", ["torch", "mlx"])
+def test_all_masked_corrections_keep_bc_gradient_and_every_optimizer_update(backend):
+    if backend == "mlx":
+        mx = pytest.importorskip("mlx.core")
+        if not mx.metal.is_available():
+            pytest.skip("MLX masked anchor training requires Metal")
+    dataset, features = data_and_features()
+    dataset.episodes[0] = correction(dataset.episodes[0])
+    first, second = make_agent(), make_agent()
+    initial = {name: p.detach().clone() for name, p in first.named_parameters()}
+    results = [train_imitation(agent, dataset, epochs=2, backend=backend,
+        feature_provider=features.__getitem__, **options)
+        for agent, options in zip((first, second), ({}, {
+            "canonical_anchor_coefficient": 4, "canonical_anchor_exclude_corrections": True}),
+            strict=True)]
+    assert results[0]["optimizer_steps"] == results[1]["optimizer_steps"] == 2
+    assert results[1]["canonical_anchor"]["eligible_episodes"] == 0
+    for row in results[1]["history"]:
+        assert row["anchor_kl"] == row["anchor_eligible_episodes"] == 0
+        assert row["total_objective"] == row["bc_objective"]
+    assert any(not torch.equal(p, initial[name]) for name, p in first.named_parameters())
+    for (name, p), (_, q) in zip(first.named_parameters(), second.named_parameters(), strict=True):
+        torch.testing.assert_close(p, q, rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "true", None])
+def test_correction_mask_requires_bool_before_features(invalid):
+    dataset, _ = data_and_features()
+    with pytest.raises(ValueError, match="canonical anchor exclude corrections must be bool"):
+        train_imitation(make_agent(), dataset, canonical_anchor_exclude_corrections=invalid,
+                        feature_provider=lambda _: pytest.fail("features requested"))
+
+
+def test_retention_argv_forwards_only_enabled_correction_mask():
+    from carryrl.training.retention import _argv, _settings
+
+    settings = _settings({"config": "config.json", "warm_start": "checkpoint"},
+                         coefficient=1, output="output")
+    original = _argv(settings)
+    flag = "--canonical-anchor-exclude-corrections"
+    assert flag not in original
+    assert "canonical_anchor_exclude_corrections" not in settings
+    settings["canonical_anchor_exclude_corrections"] = False
+    assert _argv(settings) == original
+    settings["canonical_anchor_exclude_corrections"] = True
+    assert _argv(settings).count(flag) == 1
+    assert [value for value in _argv(settings) if value != flag] == original
+
+
+def test_masked_mixed_gradient_equals_bc_plus_teacher_kl_over_original_canonical_count(monkeypatch):
+    import carryrl.training.imitation as module
+
+    dataset, features = data_and_features()
+    dataset.add_episode(correction(dataset.episodes[0]))
+    dataset.extend(collect_native_scripted_demonstrations(
+        native_train_sizes=(128,), native_episodes_per_task=1, tasks=("navigation",)))
+    features.update({index: torch.randn(4, 384) for index in range(len(dataset.frames))})
+    student, reference = make_agent(), make_agent()
+    parent, _ = _canonical_anchor_parent(reference, None)
+
+    def diverge(agent):
+        with torch.no_grad():
+            agent.decoder.dx_head.bias[0] += .7
+
+    diverge(reference)
+    bc, anchors = [], []
+    for index, episode in enumerate(dataset.episodes):
+        patches = torch.stack([features[frame] for frame in episode.frame_indices])
+        options = {"executed_actions": episode.executed_actions, "return_decoder_trace": True}
+        output = reference.evaluate_episode(patches, episode.actions, **options)
+        bc.append(_episode_nlls(output["log_prob"], episode.actions, "uniform")[0])
+        if index == 0:
+            teacher = parent.evaluate_episode(patches, episode.actions, **options)
+            anchors.append(teacher_prefix_conditional_kl(
+                teacher["decoder_trace"], output["decoder_trace"]))
+    expected = torch.stack(bc).mean() + 3 * torch.stack(anchors).sum() / 2
+    expected.backward()
+    original_snapshot = module._canonical_anchor_parent
+
+    def snapshot_then_diverge(agent, engine):
+        result = original_snapshot(agent, engine)
+        diverge(agent)
+        return result
+
+    monkeypatch.setattr(module, "_canonical_anchor_parent", snapshot_then_diverge)
+    updates = []
+    train_imitation(student, dataset, canonical_anchor_coefficient=3,
+        canonical_anchor_exclude_corrections=True, minibatch_episodes=3, max_grad_norm=1e6,
+        optimizer=torch.optim.SGD(student.parameters(), lr=.01),
+        feature_provider=features.__getitem__, on_update=updates.append)
+    assert updates[0]["total_objective"] == pytest.approx(float(expected.detach()), abs=2e-6)
+    assert updates[0]["anchor_eligible_episodes"] == 1
+    for (name, p), (_, q) in zip(student.named_parameters(), reference.named_parameters(),
+                                strict=True):
+        if q.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, atol=3e-6, rtol=3e-5, msg=name)
+
+
 def test_mixed_domain_anchor_separately_normalizes_eligible_episodes(monkeypatch):
     import carryrl.training.imitation as module
 
@@ -108,7 +266,8 @@ def test_mixed_domain_anchor_separately_normalizes_eligible_episodes(monkeypatch
     episode = dataset.episodes[0]
     actual = tuple(PhysicalAction(keys=("left",)) for _ in episode.actions)
     dataset.episodes[0] = replace(episode, source=CORRECTION_SOURCE,
-        executed_actions=actual, expert_probability=.5, terminated=True, truncated=False)
+        executed_actions=actual, expert_probability=.5, terminated=True, truncated=False,
+        quality=None, quality_source=None)
     dataset.extend(collect_native_scripted_demonstrations(
         native_train_sizes=(64, 128), native_episodes_per_task=1, tasks=("navigation",)))
     dataset.extend(augment_demonstrations(dataset, copies_per_episode=1))
@@ -118,6 +277,8 @@ def test_mixed_domain_anchor_separately_normalizes_eligible_episodes(monkeypatch
 
     def snapshot(*args, **kwargs):
         parent = original_evaluate(*args, **kwargs)
+        if not callable(getattr(parent, "evaluate_episode", None)):
+            return parent
         evaluate = parent.evaluate_episode
 
         def record(patches, actions, **options):
@@ -216,7 +377,8 @@ def test_real_mlx_torch_conditional_kl_values_and_gradients_match():
                                        atol=5e-6, rtol=5e-4, err_msg=name)
 
 
-def test_anchored_mlx_training_matches_torch_and_snapshot_stays_initial(monkeypatch):
+@pytest.mark.parametrize("exclude", [False, True])
+def test_anchored_mlx_training_matches_torch_and_snapshot_stays_initial(monkeypatch, exclude):
     mx = pytest.importorskip("mlx.core")
     if not mx.metal.is_available():
         pytest.skip("MLX anchor training requires Metal")
@@ -224,6 +386,7 @@ def test_anchored_mlx_training_matches_torch_and_snapshot_stays_initial(monkeypa
     from carryrl.training.mlx import MLXPPOBackend
 
     dataset, features = data_and_features()
+    dataset.add_episode(correction(dataset.episodes[0]))
     torch_agent, mlx_agent = make_agent(), make_agent()
     optimizers = [torch.optim.AdamW((p for p in agent.parameters() if p.requires_grad),
                                    lr=3e-4, weight_decay=.03)
@@ -248,6 +411,7 @@ def test_anchored_mlx_training_matches_torch_and_snapshot_stays_initial(monkeypa
         results.append(train_imitation(agent, dataset, epochs=2, optimizer=optimizer,
             backend=backend, mlx_backend=engine if backend == "mlx" else None,
             canonical_anchor_coefficient=1, action_balance="active_idle",
+            canonical_anchor_exclude_corrections=exclude, minibatch_episodes=2,
             feature_provider=features.__getitem__))
     assert snapshots[0][2] == snapshots[1][2]
     for result in results:

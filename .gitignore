@@ -219,7 +219,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Local experiment outputs; agent documentation lives in the three root Markdown files.
+# Local experiment outputs; their catalog lives in EXPERIMENTS.md.
 runs/
 .DS_Store
 .env.*
+.playwright-cli/

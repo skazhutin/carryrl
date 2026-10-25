@@ -141,6 +141,7 @@ def _main_reward(args) -> int:
         epochs=config.reward_epochs, seed=config.seed, device=config.device,
         image_size=config.env_image_size, max_steps=config.max_episode_steps,
         presentation_config=config.visual_config,
+        level_bank_seed=config.level_bank_seed,
     )
     print(json.dumps({"model_version": report["model_version"],
                       "tasks": report["tasks"], "gate": report["gate"],

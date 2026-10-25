@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from carryrl.agent.actions import MOUSE_BINS, PhysicalAction
+from carryrl.envs.curriculum import constructor_parameters
 
 HUD_HEIGHT = 28
 BACKGROUND = (31, 38, 52)
@@ -125,7 +126,7 @@ class GoalChoiceGame(_Game):
 
     @property
     def _safe_x(self):
-        spread = self.level.get("goal_spread", 31)
+        spread = constructor_parameters("goal_choice", self.level)["goal_spread"]
         return 48 - spread if self.level["safe_side"] == 0 else 48 + spread
 
     @property
@@ -309,8 +310,8 @@ class ShootingGame(_Game):
         self.enemy = [float(level["enemy_x"]), float(level["enemy_y"])]
         self.cursor = list(self._point(level["cursor_x"], level["cursor_y"]))
         self.hits, self.misses = 0, 0
-        self.required_hits = level.get("required_hits", 3)
-        self.aim_radius = level.get("aim_radius", 5)
+        self.required_hits = constructor_parameters("shooting", level)["required_hits"]
+        self.aim_radius = constructor_parameters("shooting", level)["aim_radius"]
         self._initial_distance = float(np.linalg.norm(np.array(self.position) - self.enemy))
 
     def step(self, action):

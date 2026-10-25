@@ -24,10 +24,11 @@ class FrozenFeatures(nn.Module):
         return self.feature
 
 
-def _agent(*, instruction=False, canonical=False):
+def _agent(*, instruction=False, canonical=False, motor_version="legacy",
+           critic_initialization="legacy"):
     torch.manual_seed(17)
     config = AgentConfig(
-        pretrained=False,
+        pretrained=False, motor_version=motor_version, critic_initialization=critic_initialization,
         **({} if canonical else dict(width=32, layers=2, heads=4, spatial_tokens=3,
                                      memory_tokens=2, segment_length=3)),
         text_encoder="multilingual_e5_small" if instruction else "none",
@@ -213,3 +214,48 @@ def test_executed_input_conditioning_parity_preserves_expert_targets():
                                    rtol=3e-5, atol=2e-5)
     with pytest.raises(ValueError, match="executed actions"):
         policy.evaluate_episode(patches, labels, executed_actions=executed[:-1])
+
+
+def test_motor_v2_complete_replay_trace_and_gradient_parity_with_executed_history():
+    agent = _agent(motor_version="motor_v2", critic_initialization="zero")
+    patches, actions = torch.randn(7, 4, 384), _actions()
+    executed = [PhysicalAction(keys=("w", "space")), PhysicalAction(),
+                PhysicalAction(keys=("a", "shift")), PhysicalAction(),
+                PhysicalAction(keys=("right",)), PhysicalAction(), PhysicalAction()]
+    expected = agent.evaluate_episode(patches, actions, executed_actions=executed,
+                                      return_decoder_trace=True)
+    policy = MLXPolicy.from_torch(agent)
+    actual = policy.evaluate_episode(patches, actions, executed_actions=executed,
+                                     return_decoder_trace=True)
+    mx.eval(actual)
+    for name in ("log_prob", "entropy", "value"):
+        np.testing.assert_allclose(np.array(actual[name]), expected[name].detach().numpy(),
+                                   rtol=3e-5, atol=3e-5)
+    assert len(actual["decoder_trace"]) == len(expected["decoder_trace"])
+    for (actual_logits, actual_mask), (expected_logits, expected_mask) in zip(
+            actual["decoder_trace"], expected["decoder_trace"], strict=True):
+        np.testing.assert_allclose(np.array(actual_logits), expected_logits.detach().numpy(),
+                                   rtol=3e-5, atol=3e-5)
+        np.testing.assert_array_equal(np.array(actual_mask), expected_mask.numpy())
+    torch_loss = -(expected["log_prob"] + .02 * expected["entropy"]).mean()
+    torch_loss.backward()
+
+    def loss_fn(model):
+        result = model.evaluate_episode(patches, actions, executed_actions=executed)
+        return -mx.mean(result["log_prob"] + .02 * result["entropy"])
+
+    loss, gradients = mnn.value_and_grad(policy, loss_fn)(policy)
+    mx.eval(loss, gradients)
+    assert float(loss) == pytest.approx(float(torch_loss.detach()), rel=3e-5, abs=2e-5)
+    for name, parameter in agent.named_parameters():
+        if name.startswith("decoder."):
+            actual_gradient = np.array(gradients["weights"][name])
+            assert np.isfinite(actual_gradient).all(), name
+            assert parameter.grad is not None
+            np.testing.assert_allclose(actual_gradient, parameter.grad.numpy(),
+                                       rtol=3e-3, atol=8e-6, err_msg=name)
+    for name in ("decoder.motion_head.weight", "decoder.motion_embedding.weight"):
+        assert np.linalg.norm(np.array(gradients["weights"][name])) > 0
+    policy.export_to_torch(agent)
+    assert agent.decoder.motor_version == "motor_v2"
+    assert agent.config.critic_initialization == "zero"

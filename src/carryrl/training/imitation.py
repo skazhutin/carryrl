@@ -27,6 +27,7 @@ from carryrl.envs.atomic import (
     BALL,
     PLAYER,
     TARGET,
+    TICK_SECONDS,
     AtomicEnv,
     _centroid,
     _identity,
@@ -42,13 +43,116 @@ from carryrl.envs.atomic_suite import (
     TASKS,
     get_extra_controller,
 )
+from carryrl.envs.runtime_identity import (
+    allowed_runtime_train_indices,
+    atomic_runtime_level_id,
+    runtime_heldout_collisions,
+)
+from carryrl.evaluation.quality import QUALITY_VERSION, command_input_units
 from carryrl.training.sequence import FrozenFrameCache
 
 SOURCE = "scripted_teacher"
 NATIVE_SOURCE = "scripted_native_rgb_teacher"
 CORRECTION_SOURCE = "scripted_rgb_correction"
 MEMORY_COUNTERPART_SOURCE = "scripted_memory_cue_counterpart"
+NAVIGATION_GEOMETRY_SOURCE = "scripted_navigation_geometry"
+REACTION_DYNAMICS_SOURCE = "scripted_reaction_dynamics"
 METHOD = "behavioural_cloning_joint_action_nll"
+QUALITY_SOURCE = "actual_executed_trajectory"
+
+
+def _validate_trajectory_quality(quality, *, task, actions, outcome, scoring_version):
+    """Check accounting of executed inputs, independently of teacher target labels."""
+    counters = {"commands", "active_commands", "neutral_commands", "input_units",
+                "command_units", "unnecessary_input_units"}
+    optional_counters = {"optimal_command_units", "excess_command_units", "terminal_payoff",
+                         "hits", "misses"}
+    expected = counters | optional_counters | {"quality_version", "task", "source",
+                                               "game_seconds", "completion_efficiency"}
+    if (not isinstance(quality, dict) or set(quality) != expected
+            or quality.get("quality_version") != QUALITY_VERSION
+            or quality.get("task") != task
+            or quality.get("source") != "diagnostic environment accounting; not policy/reward input"
+            or scoring_version != SCORING_VERSION):
+        raise ValueError("trajectory quality requires current environment accounting and scoring")
+    for name in counters | optional_counters:
+        value = quality[name]
+        if value is None and name in optional_counters:
+            continue
+        if type(value) is not int or value < 0:
+            raise ValueError(f"trajectory quality {name} must be a nonnegative integer")
+    for name in ("game_seconds", "completion_efficiency"):
+        value = quality[name]
+        if value is None and name == "completion_efficiency":
+            continue
+        try:
+            finite = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite or value < 0:
+            raise ValueError(f"trajectory quality {name} must be finite and nonnegative")
+    units = sum(command_input_units(action) for action in actions)
+    neutral = sum(command_input_units(action) == 0 for action in actions)
+    if (quality["commands"] != len(actions) or quality["neutral_commands"] != neutral
+            or quality["active_commands"] != len(actions) - neutral
+            or quality["input_units"] != units
+            or quality["command_units"] != units + neutral
+            or quality["unnecessary_input_units"] > units
+            or not math.isclose(quality["game_seconds"], len(actions) * TICK_SECONDS)):
+        raise ValueError("trajectory quality counters must match actual executed actions")
+    success = outcome.get("success") is True and outcome.get("failure") is False
+    navigation = ("optimal_command_units", "excess_command_units", "completion_efficiency")
+    if task == "navigation":
+        optimum, excess, efficiency = (quality[name] for name in navigation)
+        if optimum is None:
+            raise ValueError("navigation quality requires its shortest cardinal input count")
+        if success:
+            commands = quality["command_units"]
+            if (excess != commands - optimum or efficiency is None
+                    or not 0 <= efficiency <= 1
+                    or not math.isclose(efficiency, optimum / commands)):
+                raise ValueError("navigation quality completion accounting is inconsistent")
+        elif excess is not None or efficiency is not None:
+            raise ValueError("unfinished navigation cannot certify completion efficiency")
+    elif any(quality[name] is not None for name in navigation):
+        raise ValueError("only navigation has certified optimal command accounting")
+    payoff = quality["terminal_payoff"]
+    if task == "goal_choice":
+        if ((success and (payoff is None or not 1 <= payoff <= 5))
+                or (outcome.get("failure") is True and payoff != 0)
+                or (not success and outcome.get("failure") is not True and payoff is not None)):
+            raise ValueError("goal quality payoff must describe its actual terminal outcome")
+    elif payoff is not None:
+        raise ValueError("terminal payoff belongs only to goal_choice")
+    for name, supported in (("hits", {"reaction", "mouse", "shooting"}),
+                            ("misses", {"mouse", "shooting"})):
+        if (quality[name] is None) != (task not in supported):
+            raise ValueError(f"trajectory quality {name} is incompatible with its task")
+        if quality[name] is not None and quality[name] > len(actions):
+            raise ValueError(f"trajectory quality {name} cannot exceed executed commands")
+
+
+def _validate_pure_teacher_quality(quality, *, task, outcome):
+    if (outcome.get("known") is not True or outcome.get("success") is not True
+            or outcome.get("failure") is not False
+            or quality["unnecessary_input_units"] != 0
+            or (task == "navigation" and quality["excess_command_units"] != 0)):
+        raise ValueError("pure teacher quality requires visible success, no audited unnecessary "
+                         "inputs, and a shortest navigation trajectory")
+
+
+def _collected_quality(info, *, task, actions, outcome, pure_teacher):
+    """Admit real final diagnostics; corrections need not succeed or be efficient."""
+    quality = deepcopy(info.get("quality")) if isinstance(info, Mapping) else None
+    try:
+        _validate_trajectory_quality(quality, task=task, actions=actions, outcome=outcome,
+            scoring_version=info.get("scoring_version") if isinstance(info, Mapping) else None)
+        if pure_teacher:
+            _validate_pure_teacher_quality(quality, task=task, outcome=outcome)
+    except ValueError as exc:
+        kind = "teacher" if pure_teacher else "trajectory"
+        raise RuntimeError(f"scripted {kind} quality gate failed: {task}: {exc}") from exc
+    return quality
 
 
 @dataclass(frozen=True)
@@ -78,10 +182,14 @@ class DemonstrationEpisode:
     native_size: int | None = None
     collection_type: str | None = None
     scoring_version: str | None = None
+    quality: dict | None = None
+    # Presentation copies retain accounting of their source physical rollout.
+    quality_source: str | None = None
 
     def __post_init__(self):
         if self.split != "train" or self.source not in {
-                SOURCE, NATIVE_SOURCE, CORRECTION_SOURCE, MEMORY_COUNTERPART_SOURCE}:
+                SOURCE, NATIVE_SOURCE, CORRECTION_SOURCE, MEMORY_COUNTERPART_SOURCE,
+                NAVIGATION_GEOMETRY_SOURCE, REACTION_DYNAMICS_SOURCE}:
             raise ValueError("imitation accepts only train scripted_teacher demonstrations "
                              "or scripted_rgb_correction trajectories")
         if not self.actions or len(self.actions) != len(self.frame_indices):
@@ -100,7 +208,20 @@ class DemonstrationEpisode:
         elif (self.outcome.get("known") is not True or self.outcome.get("success") is not True
                 or self.outcome.get("failure") is not False):
             raise ValueError("scripted teacher quality gate requires visible success")
-        if self.source == MEMORY_COUNTERPART_SOURCE:
+        if self.source in {NAVIGATION_GEOMETRY_SOURCE, REACTION_DYNAMICS_SOURCE}:
+            expected_task = ("navigation" if self.source == NAVIGATION_GEOMETRY_SOURCE
+                             else "reaction")
+            if (self.task != expected_task or type(self.difficulty) not in (int, float)
+                    or self.difficulty != 1.0 or self.native_size is not None
+                    or self.origin_level_id is None or self.runtime_level_id is None
+                    or not isinstance(self.runtime_level_override, dict)
+                    or self.terminated is not True or self.truncated is not False
+                    or self.executed_actions != self.actions or self.quality is None):
+                kind = ("navigation geometry" if self.source == NAVIGATION_GEOMETRY_SOURCE
+                        else "reaction dynamics")
+                raise ValueError(f"{kind} requires canonical full-difficulty "
+                                 "teacher actions and complete runtime provenance")
+        elif self.source == MEMORY_COUNTERPART_SOURCE:
             if (self.task != "memory" or isinstance(self.difficulty, bool) or self.difficulty != 1.0
                     or type(self.level_index) is not int
                     or self.origin_level_id is None or self.runtime_level_id is None
@@ -154,6 +275,19 @@ class DemonstrationEpisode:
         if self.scoring_version is not None and self.scoring_version not in {
                 "legacy.v0", SCORING_VERSION}:
             raise ValueError("unsupported demonstration scoring version")
+        if self.quality is None:
+            if self.quality_source is not None:
+                raise ValueError("quality_source requires actual trajectory diagnostics")
+        else:
+            if self.quality_source != QUALITY_SOURCE:
+                raise ValueError("quality_source must identify the actual executed trajectory")
+            _validate_trajectory_quality(self.quality, task=self.task,
+                actions=(self.executed_actions if self.executed_actions is not None
+                         else self.actions),
+                outcome=self.outcome, scoring_version=self.scoring_version)
+            if self.source != CORRECTION_SOURCE:
+                _validate_pure_teacher_quality(self.quality, task=self.task, outcome=self.outcome)
+            object.__setattr__(self, "quality", deepcopy(self.quality))
         validate_instruction(self.instruction)
 
     @property
@@ -164,6 +298,9 @@ class DemonstrationEpisode:
         return len(self.actions)
 
     def to_dict(self) -> dict:
+        if self.source in {NAVIGATION_GEOMETRY_SOURCE, REACTION_DYNAMICS_SOURCE}:
+            self.__post_init__()
+            _episode_runtime_level(self)
         return {
             "source": self.source, "split": self.split, "task": self.task,
             "seed": self.seed, "level_id": self.level_id, "level_index": self.level_index,
@@ -179,6 +316,8 @@ class DemonstrationEpisode:
                if self.source == CORRECTION_SOURCE else {}),
             **({"presentation": dict(self.presentation)} if self.presentation is not None else {}),
             **({"scoring_version": self.scoring_version} if self.scoring_version else {}),
+            **({"quality": deepcopy(self.quality), "quality_source": self.quality_source}
+               if self.quality is not None else {}),
             **({"collection_type": self.collection_type,
                 "teacher_presentation": "canonical RGB of the same live state",
                 "appearance_application": "live environment learner rollout"}
@@ -191,7 +330,8 @@ class DemonstrationEpisode:
                 "runtime_level_id": self.runtime_level_id,
                 "runtime_level_override": deepcopy(self.runtime_level_override),
                 "terminated": self.terminated, "truncated": self.truncated}
-               if self.source == MEMORY_COUNTERPART_SOURCE else {}),
+               if self.source in {MEMORY_COUNTERPART_SOURCE, NAVIGATION_GEOMETRY_SOURCE,
+                                  REACTION_DYNAMICS_SOURCE} else {}),
             **({"native_size": self.native_size, "origin_level_id": self.origin_level_id,
                 "runtime_level_id": self.runtime_level_id,
                 "terminated": self.terminated, "truncated": self.truncated,
@@ -200,6 +340,59 @@ class DemonstrationEpisode:
                                            else "canonical environment rollout")}
                if self.source == NATIVE_SOURCE else {}),
         }
+
+
+def _episode_runtime_level(episode):
+    banks = (atomic_level_banks(episode.task, episode.level_bank_seed)
+             if episode.level_bank_seed else atomic_level_banks(episode.task))
+    bank = banks["train"]
+    if (type(episode.level_index) is not int or not 0 <= episode.level_index < len(bank)
+            or _identity(bank[episode.level_index]) != episode.level_id):
+        raise ValueError("demonstration level must belong to the training bank")
+    runtime = bank[episode.level_index]
+    if episode.source == MEMORY_COUNTERPART_SOURCE:
+        if episode.origin_level_id != episode.level_id:
+            raise ValueError("memory counterpart origin must match its training-bank identity")
+        runtime = _flipped_memory_level(runtime)
+        if (episode.runtime_level_override != runtime
+                or episode.runtime_level_id != _identity(runtime)):
+            raise ValueError("counterpart runtime must equal its origin with only cue flipped")
+    if episode.source == NAVIGATION_GEOMETRY_SOURCE:
+        from carryrl.training.navigation_geometry import validate_navigation_runtime
+
+        runtime = validate_navigation_runtime(episode, runtime)
+    if episode.source == REACTION_DYNAMICS_SOURCE:
+        from carryrl.training.reaction_dynamics import validate_reaction_runtime
+
+        runtime = validate_reaction_runtime(episode, runtime)
+    return runtime
+
+
+def validate_dataset_runtime_holdout(dataset, *, level_bank_seed: int,
+                                     evaluation_difficulty: float) -> None:
+    """Reject source or endpoint held-out matches before corpus publication/encoding.
+
+    Runtime provenance is reconstructed from each source bank; this check reads
+    episode records only and never changes the rows or the evaluation protocol.
+    """
+    if type(level_bank_seed) is not int or not 0 <= level_bank_seed < 2**32:
+        raise ValueError("level_bank_seed must be a uint32 integer")
+    if (isinstance(evaluation_difficulty, bool)
+            or not isinstance(evaluation_difficulty, (int, float))
+            or not math.isfinite(evaluation_difficulty) or not 0 <= evaluation_difficulty <= 1):
+        raise ValueError("runtime evaluation difficulty must be finite and in [0,1]")
+    for episode in dataset.episodes:
+        if not isinstance(episode, DemonstrationEpisode):
+            raise ValueError("runtime hold-out validation requires demonstration episodes")
+        episode.__post_init__()
+        runtime = _episode_runtime_level(episode)
+        for bank_seed in dict.fromkeys((episode.level_bank_seed, level_bank_seed)):
+            matches = runtime_heldout_collisions(episode.task, runtime, episode.difficulty,
+                bank_seed, heldout_difficulties=(evaluation_difficulty,))
+            if matches:
+                raise ValueError("demonstration overlaps a held-out runtime semantic level "
+                    f"for evaluation endpoint: {episode.task}, source bank "
+                    f"{episode.level_bank_seed}, level {episode.level_index}; match {matches[0]}")
 
 
 class DemonstrationDataset:
@@ -258,32 +451,23 @@ class DemonstrationDataset:
             if any(self.frames[index].shape != (episode.native_size, episode.native_size, 3)
                    for index in indices):
                 raise ValueError("native episode RGB must match its declared native_size")
-        bank = (atomic_level_banks(episode.task, episode.level_bank_seed)
-                if episode.level_bank_seed else atomic_level_banks(episode.task))["train"]
-        if (not 0 <= episode.level_index < len(bank)
-                or _identity(bank[episode.level_index]) != episode.level_id):
-            raise ValueError("demonstration level must belong to the training bank")
-        if episode.collection_type == "live_styled":
-            identity = atomic_semantic_level_id(episode.task, bank[episode.level_index])
-            if any(identity == atomic_semantic_level_id(episode.task, level)
-                   for bank_seed in {0, 20261008, episode.level_bank_seed}
-                   for split in ("validation", "test")
-                   for level in atomic_level_banks(episode.task, bank_seed)[split]):
-                raise ValueError("live styled correction overlaps a held-out semantic level")
+        runtime = _episode_runtime_level(episode)
+        if runtime_heldout_collisions(episode.task, runtime, episode.difficulty,
+                                      episode.level_bank_seed):
+            raise ValueError("demonstration overlaps a held-out runtime semantic level")
         visible = verify_visible_outcome(self.frames[episode.final_frame_index])
         if visible != episode.outcome:
             raise ValueError("demonstration outcome must match its final visible RGB")
         if episode.source == MEMORY_COUNTERPART_SOURCE:
-            origin = bank[episode.level_index]
-            if episode.origin_level_id != episode.level_id:
-                raise ValueError("memory counterpart origin must match its training-bank identity")
-            runtime = _flipped_memory_level(origin)
-            if (episode.runtime_level_override != runtime
-                    or episode.runtime_level_id != _identity(runtime)):
-                raise ValueError("counterpart runtime must equal its origin with only cue flipped")
-            if _memory_heldout_collisions(runtime, episode.level_bank_seed):
-                raise ValueError("memory counterpart collides with a held-out semantic level")
             _validate_memory_teacher_trace(self, episode, runtime)
+        if episode.source == NAVIGATION_GEOMETRY_SOURCE:
+            from carryrl.training.navigation_geometry import validate_navigation_teacher_trace
+
+            validate_navigation_teacher_trace(self, episode, runtime)
+        if episode.source == REACTION_DYNAMICS_SOURCE:
+            from carryrl.training.reaction_dynamics import validate_reaction_teacher_trace
+
+            validate_reaction_teacher_trace(self, episode, runtime)
     def add_episode(self, episode: DemonstrationEpisode) -> None:
         self._validate_episode(episode)
         if episode.native_size is not None:
@@ -388,6 +572,8 @@ class DemonstrationDataset:
 def augment_demonstrations(
     dataset: DemonstrationDataset, *, seed: int = 0, copies_per_episode: int = 1,
     max_frame_bytes: int = 256 * 1024**2,
+    themes: Sequence[str] | None = None, hud_layouts: Sequence[str] | None = None,
+    textures: bool = True, canvas_padding: int = 8,
 ) -> DemonstrationDataset:
     """Return train appearance copies of canonical episodes without modifying originals.
 
@@ -396,6 +582,8 @@ def augment_demonstrations(
     Teachers are never queried on transformed RGB: their recorded labels and the
     actual input history remain unchanged. Extend the original dataset explicitly
     when both canonical and transformed episodes should be used for training.
+    Optional appearance controls only select train themes and placement; they do
+    not resize the native viewport or change the physical trajectory.
     """
     from carryrl.envs.presentation import (
         HUD_LAYOUTS,
@@ -408,6 +596,24 @@ def augment_demonstrations(
         raise ValueError("augmentation seed must be a uint32 integer")
     if type(copies_per_episode) is not int or copies_per_episode < 1:
         raise ValueError("copies_per_episode must be a positive integer")
+    selections = []
+    for name, values, allowed in (("themes", themes, THEME_SPLITS["train"]),
+                                  ("hud_layouts", hud_layouts, HUD_LAYOUTS)):
+        try:
+            selected = tuple(allowed if values is None else values)
+        except TypeError as error:
+            raise ValueError(f"augmentation {name} must be a nonempty unique selection") from error
+        if (not selected or any(not isinstance(value, str) or value not in allowed
+                                for value in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError(f"augmentation {name} must be a nonempty unique selection "
+                             f"from {allowed}")
+        selections.append(selected)
+    themes, hud_layouts = selections
+    if type(textures) is not bool:
+        raise ValueError("augmentation textures must be a boolean")
+    if type(canvas_padding) is not int or not 4 <= canvas_padding <= 64:
+        raise ValueError("augmentation canvas_padding must be an integer in 4..64")
     augmented = DemonstrationDataset(max_frame_bytes=max_frame_bytes)
     # Validate all inputs before starting transformations; bank/split checks remain
     # identical to collection and training, including manually assembled datasets.
@@ -424,9 +630,10 @@ def augment_demonstrations(
         for _ in range(copies_per_episode):
             profile = PresentationProfile(
                 native_size=episode.native_size or 96,
-                theme=str(rng.choice(THEME_SPLITS["train"])),
-                hud_layout=str(rng.choice(HUD_LAYOUTS)),
-                texture_seed=int(rng.integers(2**31)), textures=True,
+                theme=str(rng.choice(themes)),
+                hud_layout=str(rng.choice(hud_layouts)),
+                texture_seed=int(rng.integers(2**31)), textures=textures,
+                canvas_padding=canvas_padding,
             )
             # Exact repeated RGB within a trajectory receives the exact same style.
             mapping = {}
@@ -515,16 +722,7 @@ def _flipped_memory_level(origin: dict) -> dict:
 
 
 def _memory_heldout_collisions(runtime: dict, level_bank_seed: int) -> list[dict]:
-    identity = atomic_semantic_level_id("memory", runtime)
-    matches = []
-    for bank_seed in dict.fromkeys((0, level_bank_seed)):
-        banks = atomic_level_banks("memory", bank_seed)
-        for split in ("validation", "test"):
-            for index, level in enumerate(banks[split]):
-                if atomic_semantic_level_id("memory", level) == identity:
-                    matches.append({"level_bank_seed": bank_seed, "split": split,
-                                    "level_index": index, "level_id": _identity(level)})
-    return matches
+    return runtime_heldout_collisions("memory", runtime, 1.0, level_bank_seed)
 
 
 class _MemoryCueRuntimeEnv(AtomicEnv):
@@ -563,7 +761,7 @@ def _validate_memory_teacher_trace(dataset, episode, runtime):
             rgb = np.frombuffer(frame.tobytes(), dtype=np.uint8).reshape(frame.shape)
             if action != teacher.act(rgb):
                 raise ValueError("memory trace labels must come from the neutral-wait RGB teacher")
-            frame, _, terminated, truncated, _ = env.step(action)
+            frame, _, terminated, truncated, final_info = env.step(action)
             teacher.observe_action(action)
             if (terminated or truncated) and step != len(episode) - 1:
                 raise ValueError("memory teacher trace must be a whole episode")
@@ -573,6 +771,8 @@ def _validate_memory_teacher_trace(dataset, episode, runtime):
             raise ValueError("memory teacher final RGB does not match its declared runtime")
         if not terminated or truncated or not verify_visible_outcome(frame)["success"]:
             raise ValueError("memory teacher trace must end in visible success")
+        if episode.quality is not None and episode.quality != final_info.get("quality"):
+            raise ValueError("memory quality does not match its actual executed trajectory")
     finally:
         env.close()
 
@@ -647,7 +847,7 @@ def collect_memory_cue_counterparts(
                     raise TypeError("memory counterpart teacher must return a PhysicalAction")
                 indices.append(index)
                 actions.append(action)
-                frame, _, terminated, truncated, _ = env.step(action)
+                frame, _, terminated, truncated, final_info = env.step(action)
                 if callable(getattr(teacher, "observe_action", None)):
                     teacher.observe_action(action)
                 if terminated or truncated:
@@ -656,11 +856,13 @@ def collect_memory_cue_counterparts(
             if (not terminated or truncated or outcome.get("success") is not True
                     or outcome.get("known") is not True or outcome.get("failure") is not False):
                 raise RuntimeError("memory counterpart teacher quality gate failed")
+            quality = _collected_quality(final_info, task="memory", actions=actions,
+                                         outcome=outcome, pure_teacher=True)
             result.add_episode(DemonstrationEpisode(tuple(indices), tuple(actions),
                 result.intern_frame(frame), origin.instruction, "memory", origin.seed,
                 origin.level_id, origin.level_index, 1.0, dict(outcome),
                 source=MEMORY_COUNTERPART_SOURCE, terminated=True, truncated=False,
-                scoring_version=SCORING_VERSION,
+                scoring_version=SCORING_VERSION, quality=quality, quality_source=QUALITY_SOURCE,
                 level_bank_seed=origin.level_bank_seed, origin_level_id=origin.level_id,
                 runtime_level_id=_identity(runtime), runtime_level_override=deepcopy(runtime)))
             report["pairs_collected"] = len(result.episodes)
@@ -730,16 +932,28 @@ def collect_scripted_demonstrations(
     if type(level_bank_seed) is not int or not 0 <= level_bank_seed < 2**32:
         raise ValueError("level_bank_seed must be a uint32 integer")
     dataset = DemonstrationDataset(max_frame_bytes=max_frame_bytes)
+    allowed_by_task = {task: allowed_runtime_train_indices(task, level_bank_seed, difficulty)
+                       for task in tasks}
+    for task, allowed_indices in allowed_by_task.items():
+        if native_size is not None:
+            bank = atomic_level_banks(task, level_bank_seed)["train"]
+            unique_indices = {}
+            for level_index in allowed_indices:
+                unique_indices.setdefault(atomic_runtime_level_id(
+                    task, bank[level_index], difficulty), level_index)
+            allowed_by_task[task] = list(unique_indices.values())
+            if len(unique_indices) < episodes_per_task:
+                raise ValueError("native training bank lacks enough unique runtime levels "
+                                 "without held-out semantic matches")
     for task in tasks:
+        allowed_indices = allowed_by_task[task]
         env = env_factory(task, split="train", image_size=image_size,
                           max_steps=max_steps, difficulty=difficulty,
                           **({"level_bank_seed": level_bank_seed} if level_bank_seed else {}))
         try:
             for index in range(episodes_per_task):
                 episode_seed = seed + 10000 * TASKS.index(task) + index
-                bank = (atomic_level_banks(task, level_bank_seed) if level_bank_seed
-                        else atomic_level_banks(task))["train"]
-                level_index = (seed + index) % len(bank)
+                level_index = allowed_indices[(seed + index) % len(allowed_indices)]
                 frame, info = env.reset(seed=episode_seed, options={"level_index": level_index})
                 level_id = info["level_id"]
                 teacher = teacher_factory(task)
@@ -754,7 +968,7 @@ def collect_scripted_demonstrations(
                         raise TypeError("scripted teacher must return a complete PhysicalAction")
                     frame_indices.append(frame_index)
                     actions.append(action)
-                    frame, _, terminated, truncated, _ = env.step(action)
+                    frame, _, terminated, truncated, final_info = env.step(action)
                     if terminated or truncated:
                         break
                 if native_size is not None and frame.shape != (native_size, native_size, 3):
@@ -768,12 +982,15 @@ def collect_scripted_demonstrations(
                                        f"{native_context}: {outcome}")
                 if native_size is not None and (terminated is not True or truncated is not False):
                     raise RuntimeError("native teacher success must end its environment trajectory")
+                quality = _collected_quality(final_info, task=task, actions=actions,
+                                             outcome=outcome, pure_teacher=True)
                 variants = instructions.get(task)
                 instruction = variants[index % len(variants)] if variants else None
                 dataset.add_episode(DemonstrationEpisode(
                     tuple(frame_indices), tuple(actions), dataset.intern_frame(frame), instruction,
                     task, episode_seed, level_id, level_index, float(difficulty), dict(outcome),
                     level_bank_seed=level_bank_seed, scoring_version=SCORING_VERSION,
+                    quality=quality, quality_source=QUALITY_SOURCE,
                     **({"source": NATIVE_SOURCE, "native_size": native_size,
                         "origin_level_id": level_id, "runtime_level_id": level_id,
                         "terminated": terminated, "truncated": truncated}
@@ -864,6 +1081,12 @@ def collect_scripted_corrections(
         if feature_cache.agent is not agent:
             raise ValueError("correction cache belongs to a different agent")
         feature_cache.assert_unchanged()
+    allowed_by_task = {task: allowed_runtime_train_indices(task, level_bank_seed, difficulty)
+                       for task in tasks}
+    if presentation_config is not None and any(
+            len(indices) < episodes_per_task for indices in allowed_by_task.values()):
+        raise ValueError("live styled training bank lacks enough levels "
+                         "without held-out semantic matches")
     dataset = DemonstrationDataset(max_frame_bytes=max_frame_bytes)
     rng = np.random.default_rng(seed)
     training = agent.training
@@ -871,19 +1094,7 @@ def collect_scripted_corrections(
     try:
         with torch.no_grad():
             for task in tasks:
-                bank = atomic_level_banks(task, level_bank_seed)["train"]
-                allowed_indices = list(range(len(bank)))
-                if presentation_config is not None:
-                    heldout = {
-                        atomic_semantic_level_id(task, level)
-                        for bank_seed in {0, 20261008, level_bank_seed}
-                        for heldout_split in ("validation", "test")
-                        for level in atomic_level_banks(task, bank_seed)[heldout_split]}
-                    allowed_indices = [index for index, level in enumerate(bank)
-                        if atomic_semantic_level_id(task, level) not in heldout]
-                    if len(allowed_indices) < episodes_per_task:
-                        raise ValueError("live styled training bank lacks enough levels "
-                                         "without held-out semantic matches")
+                allowed_indices = allowed_by_task[task]
                 env = env_factory(task, split="train", image_size=image_size,
                                   max_steps=max_steps, difficulty=difficulty,
                                   **({"visual_config": presentation_config}
@@ -935,7 +1146,9 @@ def collect_scripted_corrections(
                             # The learner advances its memory once at every actual frame,
                             # even when mixing chooses the expert's physical input.
                             learner = (agent.act(rgb.copy(), deterministic=True)
-                                if feature_cache is None else agent.act_from_patches(
+                                if feature_cache is None
+                                or getattr(agent, "screen_text_reader", None) is not None
+                                else agent.act_from_patches(
                                     feature_cache.encode(rgb.copy()), deterministic=True))
                             use_expert = (step >= learner_prefix_steps
                                           and rng.random() < expert_probability)
@@ -945,13 +1158,15 @@ def collect_scripted_corrections(
                             frame_indices.append(frame_index)
                             labels.append(label)
                             executed.append(action)
-                            frame, _, terminated, truncated, _ = env.step(action)
+                            frame, _, terminated, truncated, final_info = env.step(action)
                             agent.observe_action(action)
                             teacher.observe_action(action)
                             expert_steps += int(use_expert)
                             if terminated or truncated:
                                 break
                         outcome = verify_visible_outcome(frame)
+                        quality = _collected_quality(final_info, task=task, actions=executed,
+                                                     outcome=outcome, pure_teacher=False)
                         dataset.add_episode(DemonstrationEpisode(
                             tuple(frame_indices), tuple(labels), dataset.intern_frame(frame),
                             instruction, task, episode_seed, level_id, level_index,
@@ -963,7 +1178,8 @@ def collect_scripted_corrections(
                             learner_prefix_steps=learner_prefix_steps,
                             presentation=presentation,
                             collection_type="live_styled" if presentation is not None else None,
-                            scoring_version=SCORING_VERSION))
+                            scoring_version=SCORING_VERSION,
+                            quality=quality, quality_source=QUALITY_SOURCE))
                         if on_episode is not None:
                             on_episode({"task": task, "source": CORRECTION_SOURCE,
                                 "episodes_completed": len(dataset.episodes),
@@ -1205,7 +1421,8 @@ class SavedDemonstrationReuse:
             raise ValueError("saved demonstration frozen feature identity is malformed") from error
         producer = {key: deepcopy(metadata[key]) for key in (
             "source_checkpoint", "source_checkpoint_sha256", "initial_agent_sha256",
-            "reward_sha256", "correction_replacement", "demonstration_reuse") if key in metadata}
+            "reward_sha256", "correction_replacement", "demonstration_reuse",
+            "navigation_geometry", "runtime_diversity") if key in metadata}
         for name in ("source_checkpoint_sha256", "initial_agent_sha256", "reward_sha256"):
             digest = producer.get(name)
             if (not isinstance(digest, str) or len(digest) != 64
@@ -1259,7 +1476,7 @@ def _validate_replacement_trace(dataset, episode, max_steps):
             rgb = np.frombuffer(frame.tobytes(), dtype=np.uint8).reshape(frame.shape)
             if teacher.act(rgb) != label:
                 raise ValueError("replacement expert labels do not match the RGB teacher")
-            frame, _, terminated, truncated, _ = env.step(action)
+            frame, _, terminated, truncated, final_info = env.step(action)
             if episode.source == CORRECTION_SOURCE:
                 teacher.observe_action(action)
             if (terminated or truncated) and step != len(episode) - 1:
@@ -1271,6 +1488,8 @@ def _validate_replacement_trace(dataset, episode, max_steps):
                 raise ValueError("replacement termination flags do not match its actual trajectory")
         elif not terminated or truncated:
             raise ValueError("replacement supporting teacher must complete successfully")
+        if episode.quality is not None and episode.quality != final_info.get("quality"):
+            raise ValueError("replacement quality does not match its actual executed trajectory")
     finally:
         env.close()
 
@@ -1377,7 +1596,8 @@ def load_correction_replacement_bundle(
     fields = {"source", "split", "task", "seed", "level_id", "level_index", "difficulty",
               "instruction", "level_bank_seed", "frame_indices", "final_frame_index", "actions",
               "outcome", "executed_actions", "terminated", "truncated", "expert_probability",
-              "learner_selection", "mixing_rng", "learner_prefix_steps", "scoring_version"}
+              "learner_selection", "mixing_rng", "learner_prefix_steps", "scoring_version",
+              "quality", "quality_source"}
     required = {"source", "split", "task", "seed", "level_id", "level_index", "difficulty",
                 "instruction", "level_bank_seed", "frame_indices", "final_frame_index",
                 "actions", "outcome"}
@@ -1433,7 +1653,8 @@ def load_correction_replacement_bundle(
                               if executed is not None else None),
             terminated=row.get("terminated"), truncated=row.get("truncated"),
             expert_probability=row.get("expert_probability"),
-            scoring_version=row.get("scoring_version"))
+            scoring_version=row.get("scoring_version"),
+            quality=deepcopy(row.get("quality")), quality_source=row.get("quality_source"))
         whole.add_episode(episode)
         parsed.append(episode)
     grouped = {}
@@ -1702,11 +1923,14 @@ def _episode_nlls(log_prob, actions, action_balance):
 def imitation_nll(agent, patches: torch.Tensor, actions: Sequence[PhysicalAction],
                   *, instruction: str | None = None,
                   executed_actions: Sequence[PhysicalAction] | None = None,
-                  action_balance: str = "uniform") -> torch.Tensor:
+                  action_balance: str = "uniform",
+                  screen_text: Sequence[str | None] | None = None) -> torch.Tensor:
     """Joint action NLL; optionally balance active/idle expert labels within an episode."""
     imitation_action_weights(actions, action_balance=action_balance)
     output = agent.evaluate_episode(patches, list(actions), instruction=instruction,
-                                   executed_actions=executed_actions)
+                                   executed_actions=executed_actions,
+                                   **({"screen_text": screen_text}
+                                      if screen_text is not None else {}))
     log_prob = output["log_prob"]
     return _episode_nlls(log_prob, actions, action_balance)[0]
 
@@ -1722,14 +1946,15 @@ def _replay_domain(dataset, episode):
         return "appearance_copy"
     if episode.native_size is not None:
         return f"native_{episode.native_size}"
-    if (episode.source in {SOURCE, CORRECTION_SOURCE, MEMORY_COUNTERPART_SOURCE}
+    if (episode.source in {SOURCE, CORRECTION_SOURCE, MEMORY_COUNTERPART_SOURCE,
+                           NAVIGATION_GEOMETRY_SOURCE, REACTION_DYNAMICS_SOURCE}
             and all(dataset.frames[index].shape == (96, 96, 3)
                     for index in (*episode.frame_indices, episode.final_frame_index))):
         return "canonical_unstyled_96"
     return "other_unstyled_rgb"
 
 
-def _replay_summary(domains, canonical_replay_weight):
+def _replay_summary(domains, canonical_replay_weight, *, normalization=None):
     counts = {domain: domains.count(domain) for domain in sorted(set(domains))}
     weights = {domain: canonical_replay_weight if domain == "canonical_unstyled_96" else 1.0
                for domain in counts}
@@ -1737,11 +1962,19 @@ def _replay_summary(domains, canonical_replay_weight):
     scaled_mass = {domain: count * (weights[domain] / scale)
                    for domain, count in counts.items()}
     total = sum(scaled_mass.values())
+    if normalization is None:
+        normalization = (_replay_normalization([
+            canonical_replay_weight if domain == "canonical_unstyled_96" else 1.0
+            for domain in domains]) if domains else (1.0, 1.0))
     return {
         "canonical_replay_weight": canonical_replay_weight,
         "canonical_domain": "unstyled scripted teacher, correction, or memory counterpart; "
                             "no native_size; all replay and final RGB frames physically 96x96",
         "aggregation": "sum(episode_weight * episode_objective) / sum(episode_weight)",
+        "objective_version": "global_episode_mass.v2",
+        "minibatch_normalization": "global dataset mean episode weight; stable max-weight scaling",
+        "dataset_weight_scale": normalization[0],
+        "scaled_dataset_mean_weight": normalization[1],
         "sampling": "unchanged uniform episode shuffle",
         "domains": {domain: {
             "episodes": count, "episode_weight": weights[domain],
@@ -1761,19 +1994,31 @@ def imitation_replay_summary(dataset: DemonstrationDataset, *,
                            canonical_replay_weight)
 
 
-def _replay_objective(objectives, weights):
-    """Backend-independent weighted mean, retaining the exact original all-one path."""
-    if all(weight == 1.0 for weight in weights):
+def _replay_normalization(weights):
+    scale = max(weights)
+    return scale, math.fsum(weight / scale for weight in weights) / len(weights)
+
+
+def _replay_objective(objectives, weights, *, normalization=None):
+    """Scale minibatch masses by the dataset mean, preserving all-one arithmetic.
+
+    Without an explicit dataset normalization this retains the helper's original
+    weighted-mean behaviour. Training computes the normalizer once for all episodes;
+    a one-episode minibatch therefore retains its relative replay weight.
+    """
+    if normalization is None:
+        normalization = _replay_normalization(weights)
+    scale, mean = normalization
+    if scale == 1.0 and mean == 1.0 and all(weight == 1.0 for weight in weights):
         return objectives.mean()
-    # Rescaling cancels in the ratio and avoids overflow for finite large coefficients.
-    scaled = np.asarray(weights, dtype=np.float64) / max(weights)
+    scaled = np.asarray(weights, dtype=np.float64) / scale
     if isinstance(objectives, torch.Tensor):
         factors = torch.as_tensor(scaled, dtype=objectives.dtype, device=objectives.device)
     else:
         import mlx.core as mx
 
         factors = mx.array(scaled, dtype=objectives.dtype)
-    return (objectives * factors).sum() / factors.sum()
+    return (objectives * factors).mean() / mean
 
 
 def _reported_replay_objective(objectives, weights):
@@ -1850,6 +2095,44 @@ def _canonical_anchor_parent(agent, engine):
     return parent, digest.hexdigest()
 
 
+def read_imitation_screen_text(reader, frame: np.ndarray, *, step: int):
+    """Require OCR provenance to match the exact presented policy RGB and decision."""
+    observed = reader.read(frame, step=step)
+    if (observed.frame_sha256 != hashlib.sha256(frame.tobytes(order="C")).hexdigest()
+            or observed.source_width != frame.shape[1]
+            or observed.source_height != frame.shape[0] or observed.step != step):
+        raise ValueError("screen text reader result does not match the replay RGB frame/step")
+    return observed
+
+
+class ImitationScreenText:
+    """Disk-backed, frame-and-step keyed OCR observations; no resident token corpus."""
+
+    def __init__(self, dataset, reader, path: Path):
+        from carryrl.perception.screen_text import format_model_text
+
+        self.path = Path(path)
+        self.offsets = {}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("xb") as stream:
+            for episode in dataset.episodes:
+                for step, index in enumerate(episode.frame_indices):
+                    key = index, step
+                    if key in self.offsets:
+                        continue
+                    observed = read_imitation_screen_text(
+                        reader, dataset.frames[index].copy(), step=step)
+                    record = {"frame_index": index, **observed.to_dict(),
+                              "model_text": format_model_text(observed)}
+                    self.offsets[key] = stream.tell()
+                    stream.write((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    def __call__(self, index: int, step: int) -> str:
+        with self.path.open("rb") as stream:
+            stream.seek(self.offsets[index, step])
+            return json.loads(stream.readline())["model_text"]
+
+
 def train_imitation(
     agent, dataset: DemonstrationDataset, *, epochs: int = 1, backend: str = "torch",
     optimizer=None, mlx_backend=None, learning_rate: float = 1e-4, weight_decay: float = 0.01,
@@ -1863,6 +2146,8 @@ def train_imitation(
     action_balance: str = "uniform",
     canonical_replay_weight: float = 1.0,
     canonical_anchor_coefficient: float = 0.0,
+    canonical_anchor_exclude_corrections: bool = False,
+    screen_text_provider: Callable[[int, int], str | None] | None = None,
 ) -> dict:
     """Train optionally weighted per-episode NLL; keep provenance outside the policy graph.
 
@@ -1870,19 +2155,29 @@ def train_imitation(
     never learned projections. Otherwise a byte-bounded exact-RGB cache is used.
     External providers own their feature-memory budget. Epoch callbacks see synchronized
     Torch weights and optimizer state on both backends.
+    ``screen_text_provider(frame_index, step)`` supplies OCR from that saved RGB at
+    the actual episode decision; frozen text tokens exist only within each minibatch.
     Update callbacks record completed optimizer revisions immediately. Metal weights
     synchronize at epoch boundaries and in finally, including callback interruptions.
     The supplied persistent MLX backend may subsequently continue into on-policy PPO.
     Active/idle balancing and canonical replay weighting change the optimizer objective
     only. Reported NLL stays unweighted; active/idle diagnostics average per-episode
     means of present groups. Replay weighting leaves collection and sampling unchanged.
+    Excluding corrections zeroes their anchor contribution while retaining the original
+    canonical-episode denominator; every episode still contributes its usual BC objective.
     """
     if backend not in {"torch", "mlx"}:
         raise ValueError("imitation backend must be torch or mlx")
+    if screen_text_provider is not None and getattr(agent.config, "text_encoder", "none") == "none":
+        raise ValueError("screen OCR replay requires an enabled text_encoder")
+    if getattr(agent, "screen_text_reader", None) is not None and screen_text_provider is None:
+        raise ValueError("screen OCR imitation requires a frame-aligned screen_text_provider")
     if action_balance not in {"uniform", "active_idle"}:
         raise ValueError("action_balance must be uniform or active_idle")
     _validate_canonical_replay_weight(canonical_replay_weight)
     _validate_canonical_anchor_coefficient(canonical_anchor_coefficient)
+    if type(canonical_anchor_exclude_corrections) is not bool:
+        raise ValueError("canonical anchor exclude corrections must be bool")
     if (type(epochs) is not int or epochs < 1 or type(minibatch_episodes) is not int
             or minibatch_episodes < 1 or not dataset.episodes):
         raise ValueError("imitation requires positive epochs, batch size and nonempty episodes")
@@ -1909,7 +2204,9 @@ def train_imitation(
     replay_domains = [_replay_domain(dataset, episode) for episode in dataset.episodes]
     replay_weights = [canonical_replay_weight if domain == "canonical_unstyled_96" else 1.0
                       for domain in replay_domains]
-    replay_summary = _replay_summary(replay_domains, canonical_replay_weight)
+    replay_normalization = _replay_normalization(replay_weights)
+    replay_summary = _replay_summary(replay_domains, canonical_replay_weight,
+                                    normalization=replay_normalization)
     source = dataset.provenance()["source"]
     parameters = [parameter for parameter in agent.parameters() if parameter.requires_grad]
     if optimizer is None:
@@ -1927,13 +2224,26 @@ def train_imitation(
         raise ValueError("an MLX engine requires backend mlx")
     parent, parent_hash = (_canonical_anchor_parent(agent, engine)
                            if canonical_anchor_coefficient else (None, None))
+    anchor_eligible = [domain == "canonical_unstyled_96" and not (
+        canonical_anchor_exclude_corrections and episode.source == CORRECTION_SOURCE)
+        for episode, domain in zip(dataset.episodes, replay_domains, strict=True)]
     anchor_summary = {
         "coefficient": canonical_anchor_coefficient,
+        "exclude_corrections": canonical_anchor_exclude_corrections,
         "parent_trainable_sha256": parent_hash,
         "parent_identity": "initial student policy; frozen independent trainable snapshot",
         "eligible_domain": "canonical_unstyled_96",
-        "eligible_episodes": replay_domains.count("canonical_unstyled_96"),
-        "aggregation": "mean eligible episode(mean decision(sum conditional KL(parent||student)))",
+        "eligible_episodes": sum(anchor_eligible),
+        "normalization_eligible_episodes": replay_domains.count("canonical_unstyled_96"),
+        "excluded_correction_episodes": sum(
+            canonical_anchor_exclude_corrections and episode.source == CORRECTION_SOURCE
+            and domain == "canonical_unstyled_96"
+            for episode, domain in zip(dataset.episodes, replay_domains, strict=True)),
+        "aggregation": (
+            "sum eligible episode(mean decision(sum conditional KL(parent||student))) / "
+            "pre-mask canonical eligible episodes; excluded corrections contribute zero"
+            if canonical_anchor_exclude_corrections else
+            "mean eligible episode(mean decision(sum conditional KL(parent||student)))"),
         "prefixes": "expert target action components; episode history is actual executed actions",
     }
 
@@ -1978,6 +2288,7 @@ def train_imitation(
             objectives, task_objectives, active_losses, idle_losses = [], {}, [], []
             observed_weights, observed_domains, task_weights, batch_objectives = [], [], {}, []
             anchor_losses, bc_batches, total_batches = [], [], []
+            anchor_eligible_count = 0
             completed = True
             for offset in range(0, len(order), minibatch_episodes):
                 if max_wall_seconds is not None and time.monotonic() - start >= max_wall_seconds:
@@ -1987,15 +2298,24 @@ def train_imitation(
                 episodes = [dataset.episodes[index] for index in indices]
                 batch_weights = [replay_weights[index] for index in indices]
                 batch_domains = [replay_domains[index] for index in indices]
+                batch_anchor_eligible = [parent is not None and anchor_eligible[index]
+                                         for index in indices]
+                batch_anchor_population = sum(parent is not None and
+                    domain == "canonical_unstyled_96" for domain in batch_domains)
                 batch = [(episode, encode(episode)) for episode in episodes]
+                screen_batch = ([[screen_text_provider(index, step)
+                                  for step, index in enumerate(episode.frame_indices)]
+                                 for episode in episodes]
+                                if screen_text_provider is not None else [None] * len(episodes))
                 if backend == "torch":
                     optimizer.zero_grad(set_to_none=True)
                     parts, anchors = [], []
-                    for (episode, patches), domain in zip(batch, batch_domains, strict=True):
-                        eligible = parent is not None and domain == "canonical_unstyled_96"
+                    for (episode, patches), eligible, texts in zip(
+                            batch, batch_anchor_eligible, screen_batch, strict=True):
                         output = agent.evaluate_episode(patches, list(episode.actions),
                             instruction=episode.instruction,
                             executed_actions=episode.executed_actions,
+                            **({"screen_text": texts} if texts is not None else {}),
                             **({"return_decoder_trace": True} if eligible else {}))
                         parts.append(_episode_nlls(output["log_prob"], episode.actions,
                                                   action_balance))
@@ -2004,12 +2324,15 @@ def train_imitation(
                                 teacher = parent.evaluate_episode(patches, list(episode.actions),
                                     instruction=episode.instruction,
                                     executed_actions=episode.executed_actions,
+                                    **({"screen_text": texts} if texts is not None else {}),
                                     return_decoder_trace=True)
                             anchors.append(teacher_prefix_conditional_kl(
                                 teacher["decoder_trace"], output["decoder_trace"]))
                     bc_objective = _replay_objective(torch.stack([part[0] for part in parts]),
-                                                     batch_weights)
-                    anchor_kl = (torch.stack(anchors).mean() if anchors
+                        batch_weights, normalization=replay_normalization)
+                    anchor_kl = ((torch.stack(anchors).sum() / batch_anchor_population
+                                  if canonical_anchor_exclude_corrections else
+                                  torch.stack(anchors).mean()) if anchors
                                  else bc_objective.new_zeros(()))
                     objective = (bc_objective + canonical_anchor_coefficient * anchor_kl
                                  if canonical_anchor_coefficient else bc_objective)
@@ -2036,18 +2359,23 @@ def train_imitation(
 
                     mlx_batch = [(episode, to_mlx(patches),
                                   to_mlx(agent._encode_instruction(episode.instruction))
-                                  if episode.instruction is not None else None)
-                                 for episode, patches in batch]
+                                  if episode.instruction is not None else None,
+                                  [to_mlx(value) if value is not None else None
+                                   for value in map(agent.encode_screen_text, texts)]
+                                  if texts is not None else None)
+                                 for (episode, patches), texts in zip(batch, screen_batch,
+                                                                    strict=True)]
 
                     def loss_fn():
                         parts, anchors = [], []
-                        for (episode, patches, feature), domain in zip(
-                                mlx_batch, batch_domains, strict=True):
-                            eligible = parent is not None and domain == "canonical_unstyled_96"
+                        for (episode, patches, feature, screen_features), eligible in zip(
+                                mlx_batch, batch_anchor_eligible, strict=True):
                             output = engine.policy.evaluate_episode(
                                 patches, episode.actions,
                                 instruction_features=feature,
                                 executed_actions=episode.executed_actions,
+                                **({"screen_text_features": screen_features}
+                                   if screen_features is not None else {}),
                                 **({"return_decoder_trace": True} if eligible else {}))
                             parts.append(_episode_nlls(output["log_prob"], episode.actions,
                                                       action_balance))
@@ -2055,6 +2383,8 @@ def train_imitation(
                                 teacher = parent.evaluate_episode(patches, episode.actions,
                                     instruction_features=feature,
                                     executed_actions=episode.executed_actions,
+                                    **({"screen_text_features": screen_features}
+                                       if screen_features is not None else {}),
                                     return_decoder_trace=True)
                                 anchors.append(teacher_prefix_conditional_kl(
                                     teacher["decoder_trace"], output["decoder_trace"]))
@@ -2062,8 +2392,11 @@ def train_imitation(
                                    "nll": mx.stack([part[1] for part in parts]),
                                    "active_nll": [part[2] for part in parts if part[2] is not None],
                                    "idle_nll": [part[3] for part in parts if part[3] is not None]}
-                        bc = _replay_objective(metrics["objective"], batch_weights)
-                        anchor = mx.stack(anchors).mean() if anchors else mx.array(0.0)
+                        bc = _replay_objective(metrics["objective"], batch_weights,
+                                               normalization=replay_normalization)
+                        anchor = ((mx.stack(anchors).sum() / batch_anchor_population
+                                   if canonical_anchor_exclude_corrections else
+                                   mx.stack(anchors).mean()) if anchors else mx.array(0.0))
                         metrics.update(bc_objective=bc, anchor_kl=anchor, anchors=anchors)
                         return (bc + canonical_anchor_coefficient * anchor
                                 if canonical_anchor_coefficient else bc), metrics
@@ -2083,7 +2416,9 @@ def train_imitation(
                                 *active_numbers, *idle_numbers)):
                         raise FloatingPointError("invalid MLX imitation NLL")
                     active = set(engine.policy.weights) - {"value_head.weight", "value_head.bias"}
-                    if all(feature is None for _, _, feature in mlx_batch):
+                    if all(feature is None and not any(value is not None
+                            for value in (screen_features or []))
+                           for _, _, feature, screen_features in mlx_batch):
                         active.discard("instruction_projection.weight")
                     if all(len(episode) <= agent.config.segment_length for episode in episodes):
                         active.discard("temporal.write_tokens")
@@ -2098,9 +2433,12 @@ def train_imitation(
                         "bc_objective": bc_number, "anchor_kl": anchor_number,
                         "total_objective": batch_objective,
                         "canonical_anchor_coefficient": canonical_anchor_coefficient,
+                        "canonical_anchor_exclude_corrections": (
+                            canonical_anchor_exclude_corrections),
                         "anchor_eligible_episodes": len(anchor_numbers),
                         "unweighted_objective": float(np.mean(objective_numbers)),
-                        "replay_weighting": _replay_summary(batch_domains, canonical_replay_weight),
+                        "replay_weighting": _replay_summary(batch_domains, canonical_replay_weight,
+                                                             normalization=replay_normalization),
                         "action_balance": action_balance,
                         "active_nll": float(np.mean(active_numbers)) if active_numbers else None,
                         "idle_nll": float(np.mean(idle_numbers)) if idle_numbers else None,
@@ -2115,6 +2453,9 @@ def train_imitation(
                 observed_domains.extend(batch_domains)
                 batch_objectives.append(batch_objective)
                 anchor_losses.extend(anchor_numbers)
+                if canonical_anchor_exclude_corrections:
+                    anchor_losses.extend([0.0] * (batch_anchor_population - len(anchor_numbers)))
+                anchor_eligible_count += len(anchor_numbers)
                 bc_batches.append(bc_number)
                 total_batches.append(batch_objective)
                 active_losses.extend(active_numbers)
@@ -2140,10 +2481,11 @@ def train_imitation(
                 "mean_batch_bc_objective": float(np.mean(bc_batches)) if bc_batches else None,
                 "mean_batch_total_objective": (float(np.mean(total_batches))
                                                if total_batches else None),
-                "anchor_eligible_episodes": len(anchor_losses),
+                "anchor_eligible_episodes": anchor_eligible_count,
                 "mean_batch_objective": (float(np.mean(batch_objectives))
                                          if batch_objectives else None),
-                "replay_weighting": _replay_summary(observed_domains, canonical_replay_weight),
+                "replay_weighting": _replay_summary(observed_domains, canonical_replay_weight,
+                                                     normalization=replay_normalization),
                 "action_balance": action_balance,
                 "active_nll": float(np.mean(active_losses)) if active_losses else None,
                 "idle_nll": float(np.mean(idle_losses)) if idle_losses else None,

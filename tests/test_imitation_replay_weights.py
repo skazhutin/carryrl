@@ -17,6 +17,7 @@ from carryrl.training.imitation import (
     CORRECTION_SOURCE,
     _episode_nlls,
     _replay_domain,
+    _replay_normalization,
     _replay_objective,
     augment_demonstrations,
     collect_memory_cue_counterparts,
@@ -166,7 +167,9 @@ def test_weight_does_not_change_shuffle_action_history_or_feature_requests(repla
 
 
 @pytest.mark.parametrize("canonical_weight", [1.0, 3.0])
-def test_mlx_cpu_weighted_objective_and_gradient_match_torch(replay_dataset, canonical_weight):
+@pytest.mark.parametrize("minibatch", [1, 2, 8])
+def test_mlx_cpu_weighted_objective_and_gradient_match_torch(
+        replay_dataset, canonical_weight, minibatch):
     mx = pytest.importorskip("mlx.core")
     import mlx.nn as mnn
 
@@ -203,7 +206,7 @@ def test_mlx_cpu_weighted_objective_and_gradient_match_torch(replay_dataset, can
                     agent.scalar.copy_(torch.tensor(float(self.policy.weights["scalar"])))
 
         engine = Engine()
-        options = dict(minibatch_episodes=len(dataset.episodes),
+        options = dict(minibatch_episodes=minibatch,
                        canonical_replay_weight=canonical_weight,
                        action_balance="active_idle", max_grad_norm=1e6,
                        feature_provider=features.__getitem__)
@@ -261,9 +264,52 @@ def test_extreme_finite_weight_mean_does_not_overflow():
     torch.testing.assert_close(values.grad, torch.tensor([.5, 0., .5]))
 
 
+@pytest.mark.parametrize("minibatch", [1, 2, 8])
+@pytest.mark.parametrize("weight", [1.0, 3.0, 1e308])
+def test_train_minibatch_gradients_average_to_dataset_weighted_objective(
+        replay_dataset, minibatch, weight):
+    """Frozen parameters separate objective scaling from optimizer trajectory changes."""
+    dataset, agent = replay_dataset, TinyPolicy()
+    reference, features = deepcopy(agent), features_for(dataset)
+    parts = parts_for(reference, dataset, features)
+    weights = [weight] + [1.0] * (len(parts) - 1)
+    expected = _replay_objective(torch.stack([part[0] for part in parts]), weights)
+    expected.backward()
+    optimizer = torch.optim.SGD(agent.parameters(), lr=0.0)
+    gradients = []
+    optimizer.register_step_pre_hook(lambda *_: gradients.append(float(agent.scalar.grad)))
+    result = train_imitation(agent, dataset, optimizer=optimizer,
+        minibatch_episodes=minibatch, max_grad_norm=1e6, canonical_replay_weight=weight,
+        feature_provider=features.__getitem__)
+    sizes = [min(minibatch, len(parts) - offset)
+             for offset in range(0, len(parts), minibatch)]
+    aggregate = sum(size * grad for size, grad in zip(sizes, gradients, strict=True)) / len(parts)
+    assert aggregate == pytest.approx(float(reference.scalar.grad), abs=1e-6)
+    assert result["history"][0]["objective"] == pytest.approx(float(expected.detach()), abs=1e-6)
+    if weight == 3.0:
+        unweighted = TinyPolicy()
+        unweighted_parts = parts_for(unweighted, dataset, features)
+        torch.stack([part[0] for part in unweighted_parts]).mean().backward()
+        assert aggregate != pytest.approx(float(unweighted.scalar.grad))
+
+
+def test_global_normalizer_keeps_relative_mass_for_single_episode_batches():
+    weights = [4.0, 1.0]
+    values = torch.tensor([2.0, 8.0], requires_grad=True)
+    normalization = _replay_normalization(weights)
+    losses = [_replay_objective(values[index:index + 1], [weight], normalization=normalization)
+              for index, weight in enumerate(weights)]
+    assert [float(loss.detach()) for loss in losses] == pytest.approx([3.2, 3.2])
+    torch.stack(losses).mean().backward()
+    torch.testing.assert_close(values.grad, torch.tensor([.8, .2]))
+
+
 @pytest.mark.parametrize("weight", [None, 2.5])
+@pytest.mark.parametrize("rejected_endpoint_difficulty", [None, .25])
+@pytest.mark.parametrize("exclude_corrections", [False, True])
 def test_cli_persists_weight_and_effective_domain_masses(
-        monkeypatch, tmp_path, replay_dataset, weight):
+        monkeypatch, tmp_path, replay_dataset, weight, rejected_endpoint_difficulty,
+        exclude_corrections):
     from carryrl.training.run import atomic_json
     from carryrl.training.sequence_config import SequenceRunConfig
 
@@ -277,7 +323,8 @@ def test_cli_persists_weight_and_effective_domain_masses(
     monkeypatch.setattr(script.SequenceRunConfig, "load", lambda _: config)
     monkeypatch.setattr(script, "provenance", lambda: {})
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
-        (agent, optimizer, reward, {"decisions": 0, "weights_revision": 0}))
+        (agent, optimizer, reward, {"decisions": 0, "weights_revision": 0,
+                                   "config": config.to_dict()}))
     monkeypatch.setattr(script, "tensor_hash", lambda _: "test identity")
     monkeypatch.setattr(script, "collect_scripted_demonstrations", lambda *a, **k: replay_dataset)
     monkeypatch.setattr(script, "evaluate_sequence", lambda *a, **k: {"summaries": {
@@ -289,19 +336,70 @@ def test_cli_persists_weight_and_effective_domain_masses(
 
     def stop_before_training(*args, **kwargs):
         assert kwargs["canonical_replay_weight"] == (1.0 if weight is None else weight)
+        assert kwargs["canonical_anchor_exclude_corrections"] is exclude_corrections
         raise Prepared
 
     monkeypatch.setattr(script, "train_imitation", stop_before_training)
     argv = ["train_imitation.py", "--config", "unused.json", "--warm-start", str(source),
-            "--output", str(output), "--training-backend", "torch"]
+            "--output", str(output), "--training-backend", "torch",
+            "--epochs", "2", "--minibatch-episodes", "2"]
     if weight is not None:
         argv += ["--canonical-replay-weight", str(weight)]
+    if exclude_corrections:
+        argv.append("--canonical-anchor-exclude-corrections")
+    if rejected_endpoint_difficulty is not None:
+        class EndpointRejected(Exception):
+            pass
+
+        def reject_endpoint(dataset, *, level_bank_seed, evaluation_difficulty):
+            assert dataset is replay_dataset
+            assert level_bank_seed == config.level_bank_seed
+            assert evaluation_difficulty == rejected_endpoint_difficulty
+            raise EndpointRejected
+
+        monkeypatch.setattr(script, "validate_dataset_runtime_holdout", reject_endpoint)
+        agent.encode_frames = lambda *_: pytest.fail("unsafe corpus reached feature encoding")
+        argv += ["--evaluation-difficulty", str(rejected_endpoint_difficulty)]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(EndpointRejected):
+            script.main()
+        assert "replay_weighting" not in json.loads((output / "metadata.json").read_text())
+        assert not (output / "demonstrations.json").exists()
+        return
     monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(Prepared):
         script.main()
     metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["settings"]["difficulty"] == [1.0]
     expected = 1.0 if weight is None else weight
     assert metadata["settings"]["canonical_replay_weight"] == expected
+    if exclude_corrections:
+        assert metadata["settings"]["canonical_anchor_exclude_corrections"] is True
+    else:
+        assert "canonical_anchor_exclude_corrections" not in metadata["settings"]
+    assert metadata["canonical_anchor"]["exclude_corrections"] is exclude_corrections
     assert metadata["replay_weighting"] == imitation_replay_summary(
         replay_dataset, canonical_replay_weight=expected)
     assert json.loads((output / "demonstrations.json").read_text()) == replay_dataset.provenance()
+
+    # Exercise the strict completion gate with the actual CLI-persisted settings,
+    # rather than only comparing argparse defaults before metadata is serialized.
+    from test_retention_evaluation import run_evidence
+
+    from carryrl.evaluation.retention import validate_retention_run
+    from carryrl.training.retention import _settings
+
+    plan, evidence_metadata, summary, manifest, final = run_evidence("anchor_off")
+    plan["arms"]["anchor_off"]["settings"] = _settings({
+        "config": "unused.json", "warm_start": str(source), "training_backend": "torch",
+        "epochs": 2, "minibatch_episodes": 2, "canonical_replay_weight": expected},
+        coefficient=0.0, output=output)
+    evidence_metadata["settings"] = metadata["settings"]
+    summary["backend"] = manifest["training_backend"] = "torch"
+    if exclude_corrections:
+        with pytest.raises(ValueError, match="run settings differ from plan"):
+            validate_retention_run(plan, "anchor_off", evidence_metadata, summary, manifest, final)
+    else:
+        assert metadata["settings"] == plan["arms"]["anchor_off"]["settings"]
+        assert validate_retention_run(
+            plan, "anchor_off", evidence_metadata, summary, manifest, final)["valid"] is True

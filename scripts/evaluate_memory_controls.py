@@ -267,7 +267,8 @@ def main():
     threads = torch.get_num_threads()
     try:
         torch.set_num_threads(config.torch_threads)
-        agent, _, reward, data = load_sequence_checkpoint(checkpoint, config, evaluation_only=True)
+        agent, _, reward, data = load_sequence_checkpoint(
+            checkpoint, config, evaluation_only=True, load_optimizer=False)
         report = evaluate_memory_controls(
             agent, reward, config, split=args.split, levels=args.levels, max_steps=args.max_steps,
             first_choose_nll=not args.skip_first_choose_nll,

@@ -156,6 +156,8 @@ def test_unversioned_historical_episode_rows_remain_exact_and_legacy(corpus):
     value.pop("scoring_versions")
     for row in value["episodes"]:
         row.pop("scoring_version", None)
+        row.pop("quality", None)
+        row.pop("quality_source", None)
     write_json(path, value)
     refresh_demonstration_hash(run)
     reuse = load(corpus)
@@ -317,6 +319,8 @@ def test_extra_bank_rejects_current_heldout_semantic_collision_even_with_true_pr
     row.update(task="ui", level_bank_seed=20261009, level_index=level_index,
                level_id=_identity(atomic_level_banks("ui", 20261009)["train"][level_index]),
                instruction="Use the item")
+    row.pop("quality", None)
+    row.pop("quality_source", None)
     write_json(run / "demonstrations.json", source)
     refresh_demonstration_hash(run)
     current = config.to_dict()
@@ -363,7 +367,7 @@ def test_trainer_uses_exact_corpus_different_optimizer_parent_and_bounded_encodi
         "a" * 64 if value is vision else "2" * 64 if value is reward else "6" * 64)
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
         (agent, SimpleNamespace(param_groups=[{}]), reward,
-         {"decisions": 7, "weights_revision": 123}))
+         {"decisions": 7, "weights_revision": 123, "config": config.to_dict()}))
     for name in ("collect_scripted_demonstrations", "collect_scripted_corrections",
                  "collect_native_scripted_demonstrations", "collect_memory_cue_counterparts",
                  "augment_demonstrations"):

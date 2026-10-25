@@ -18,10 +18,13 @@ class AutoregressiveActionDecoder(nn.Module):
     joint action entropy. PPO must clip the ratio of the returned joint log-probs.
     """
 
-    def __init__(self, width: int = 256):
+    def __init__(self, width: int = 256, *, motor_version: str = "legacy"):
         super().__init__()
         if isinstance(width, bool) or not isinstance(width, int) or width < 1:
             raise ValueError("width must be a positive integer")
+        if not isinstance(motor_version, str) or motor_version not in {"legacy", "motor_v2"}:
+            raise ValueError("motor version must be legacy or motor_v2")
+        self.motor_version = motor_version
         self.width = width
         self.eos_index = len(KEY_VOCAB)
         self.context = nn.Linear(width, width)
@@ -39,7 +42,11 @@ class AutoregressiveActionDecoder(nn.Module):
             nn.init.orthogonal_(head.weight, gain=0.01)
             nn.init.zeros_(head.bias)
         self.motor_initialization = "legacy"
-        self.initialize_motor_prior("legacy")
+        if motor_version == "motor_v2":
+            self.motion_embedding = nn.Embedding(4, width)
+            self.motion_head = nn.Linear(width, 4)
+            nn.init.zeros_(self.motion_head.weight)
+        self.initialize_motor_prior("balanced" if motor_version == "motor_v2" else "legacy")
 
     @torch.no_grad()
     def initialize_motor_prior(self, mode: str) -> None:
@@ -53,6 +60,11 @@ class AutoregressiveActionDecoder(nn.Module):
         if mode not in {"legacy", "balanced"}:
             raise ValueError("motor initialization must be legacy or balanced")
         self.motor_initialization = mode
+        if self.motor_version == "motor_v2":
+            self.motion_head.bias.copy_(torch.tensor(
+                [math.log(p) for p in (0.7, 0.1, 0.1, 0.1)],
+                device=self.motion_head.bias.device, dtype=self.motion_head.bias.dtype,
+            ))
         for head in (self.key_head, self.mouse_head, self.dx_head,
                      self.dy_head, self.wheel_head):
             head.bias.zero_()
@@ -87,14 +99,21 @@ class AutoregressiveActionDecoder(nn.Module):
             raise FloatingPointError("nonfinite decoder features")
         return torch.tanh(self.context(features))
 
-    def _key_distribution(self, state, last, active):
+    def _key_distribution(self, state, last, active, previous_actions=None):
         indices = torch.arange(len(KEY_VOCAB), device=state.device)
         permitted = (indices.unsqueeze(0) > last.unsqueeze(1)) & active.unsqueeze(1)
         mask = torch.cat((permitted, torch.ones_like(active).unsqueeze(1)), dim=1)
         logits = self.key_head(state)
-        if self.motor_initialization == "balanced":
+        if self.motor_initialization == "balanced" or self.motor_version == "motor_v2":
             prefix_prior = torch.zeros_like(logits)
-            prefix_prior[:, self.eos_index] = (last >= 0).to(logits.dtype) * 3.5
+            bonus = 0.5 if self.motor_version == "motor_v2" else 3.5
+            prefix_prior[:, self.eos_index] = (last >= 0).to(logits.dtype) * bonus
+            if self.motor_version == "motor_v2" and previous_actions is not None:
+                movement = {"w", "a", "s", "d", "up", "down", "left", "right"}
+                for row, previous in enumerate(previous_actions):
+                    for key in previous.keys:
+                        if key in movement:
+                            prefix_prior[row, KEY_VOCAB.index(key)] = 1.5
             logits = logits + prefix_prior
         return Categorical(logits=logits.masked_fill(~mask, -torch.inf))
 
@@ -106,6 +125,7 @@ class AutoregressiveActionDecoder(nn.Module):
         self, features: torch.Tensor, actions: Sequence[PhysicalAction] | None,
         deterministic: bool,
         trace: list | None = None,
+        previous_actions: Sequence[PhysicalAction] | None = None,
     ) -> tuple[list[PhysicalAction], torch.Tensor, torch.Tensor]:
         state = self._features(features)
         count = state.shape[0]
@@ -114,6 +134,11 @@ class AutoregressiveActionDecoder(nn.Module):
                 raise ValueError("one PhysicalAction is required per feature row")
             if any(not isinstance(action, PhysicalAction) for action in actions):
                 raise TypeError("evaluate expects PhysicalAction entries")
+        if previous_actions is not None:
+            if len(previous_actions) != count:
+                raise ValueError("one previous PhysicalAction is required per feature row")
+            if any(not isinstance(action, PhysicalAction) for action in previous_actions):
+                raise TypeError("previous actions must contain PhysicalAction entries")
         logp = features.new_zeros(count)
         entropy = features.new_zeros(count)
         active = torch.ones(count, dtype=torch.bool, device=state.device)
@@ -124,7 +149,7 @@ class AutoregressiveActionDecoder(nn.Module):
             key_targets = [tuple(KEY_VOCAB.index(key) for key in action.keys) for action in actions]
         max_keys = len(KEY_VOCAB) if key_targets is None else max(map(len, key_targets))
         for step in range(max_keys + 1):
-            distribution = self._key_distribution(state, last, active)
+            distribution = self._key_distribution(state, last, active, previous_actions)
             if trace is not None:
                 trace.append((distribution.logits, active))
             if key_targets is None:
@@ -146,6 +171,9 @@ class AutoregressiveActionDecoder(nn.Module):
             active = has_key
             if key_targets is None and not bool(active.any()):
                 break
+
+        if self.motor_version == "motor_v2":
+            return self._motion_v2(state, actions, deterministic, picked_keys, logp, entropy, trace)
 
         component_values = []
         components = (
@@ -192,23 +220,72 @@ class AutoregressiveActionDecoder(nn.Module):
             generated = list(actions)
         return generated, logp, entropy
 
+    def _motion_v2(self, state, actions, deterministic, picked_keys, logp, entropy, trace):
+        """A unique gate chooses which nonzero axes precede button and wheel choices."""
+        count = state.shape[0]
+        all_rows = torch.ones(count, dtype=torch.bool, device=state.device)
+
+        def choose(logits, targets):
+            nonlocal logp, entropy
+            distribution = Categorical(logits=logits)
+            picked = (self._choose(distribution, deterministic) if targets is None else
+                      torch.tensor(targets, device=state.device))
+            logp = logp + distribution.log_prob(picked)
+            entropy = entropy + distribution.entropy()
+            if trace is not None:
+                trace.append((distribution.logits, all_rows))
+            return picked
+
+        gate = choose(self.motion_head(state), None if actions is None else
+                      [int(action.dx != 0) + 2 * int(action.dy != 0) for action in actions])
+        state = self.state_cell(self.motion_embedding(gate), state)
+        values = []
+        bins = torch.tensor(MOUSE_BINS, device=state.device)
+        for axis, bit in (("dx", 1), ("dy", 2)):
+            enabled = (gate & bit) != 0
+            # These structural masks encode each physical command exactly once.
+            support = torch.where(enabled[:, None], bins[None] != 0, bins[None] == 0)
+            logits = getattr(self, axis + "_head")(state).masked_fill(~support, -torch.inf)
+            picked = choose(logits, None if actions is None else
+                            [MOUSE_BINS.index(getattr(action, axis)) for action in actions])
+            values.append(picked)
+            state = self.state_cell(getattr(self, axis + "_embedding")(picked), state)
+        buttons = choose(self.mouse_head(state), None if actions is None else
+                         [sum(1 << bit for bit, button in enumerate(MOUSE_BUTTONS)
+                              if button in action.mouse_buttons) for action in actions])
+        state = self.state_cell(self.mouse_embedding(buttons), state)
+        wheel = choose(self.wheel_head(state), None if actions is None else
+                       [WHEEL_BINS.index(action.wheel) for action in actions])
+        if actions is None:
+            dx, dy, button_values, wheel_values = [
+                value.detach().cpu().tolist() for value in (*values, buttons, wheel)
+            ]
+            actions = [PhysicalAction(
+                keys=tuple(picked_keys[row]),
+                mouse_buttons=tuple(button for bit, button in enumerate(MOUSE_BUTTONS)
+                                    if button_values[row] & (1 << bit)),
+                dx=MOUSE_BINS[dx[row]], dy=MOUSE_BINS[dy[row]], wheel=WHEEL_BINS[wheel_values[row]],
+            ) for row in range(count)]
+        return list(actions), logp, entropy
+
     def sample(
-        self, features: torch.Tensor, deterministic: bool = False,
+        self, features: torch.Tensor, deterministic: bool = False, *,
+        previous_actions: Sequence[PhysicalAction] | None = None,
     ) -> tuple[list[PhysicalAction], torch.Tensor, torch.Tensor]:
-        return self._run(features, None, deterministic)
+        return self._run(features, None, deterministic, previous_actions=previous_actions)
 
     def evaluate(
-        self, features: torch.Tensor, actions: Sequence[PhysicalAction],
+        self, features: torch.Tensor, actions: Sequence[PhysicalAction], *,
+        previous_actions: Sequence[PhysicalAction] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _, logp, entropy = self._run(features, actions, False)
+        _, logp, entropy = self._run(features, actions, False, previous_actions=previous_actions)
         return logp, entropy
 
-    def evaluate_with_trace(self, features: torch.Tensor, actions: Sequence[PhysicalAction]):
-        """Conditional categorical log probabilities along expert action prefixes.
-
-        Key steps include EOS; the mask excludes padding after each row's EOS.
-        This trace is optional and adds no parameters or inference behavior.
-        """
+    def evaluate_with_trace(
+        self, features: torch.Tensor, actions: Sequence[PhysicalAction], *,
+        previous_actions: Sequence[PhysicalAction] | None = None,
+    ):
+        """Conditional log probabilities and active row masks along supplied prefixes."""
         trace = []
-        _, logp, entropy = self._run(features, actions, False, trace)
+        _, logp, entropy = self._run(features, actions, False, trace, previous_actions)
         return logp, entropy, trace

@@ -26,14 +26,42 @@ from carryrl.evaluation.runner import evaluate
 from carryrl.training.config import RunConfig
 from carryrl.training.model import build_model
 
+SOURCE_IDENTITY_VERSION = "carryrl.source.v2"
 
-def atomic_json(path: Path, value: Any) -> None:
+
+def file_sha256(path: Path) -> str:
+    """Hash a file with bounded reads, including large checkpoints and lock files."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_and_lock_sha256(root: Path) -> str:
+    """Identify source contents and paths with unambiguous versioned framing."""
+    paths = [*(root / "src" / "carryrl").rglob("*.py"),
+             *(root / "scripts").rglob("*.py")]
+    lock = root / "uv.lock"
+    if lock.exists():
+        paths.append(lock)
+    digest = hashlib.sha256(SOURCE_IDENTITY_VERSION.encode() + b"\0")
+    for path in sorted(paths, key=lambda path: path.relative_to(root).as_posix()):
+        relative_path = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative_path).to_bytes(8, "big"))
+        digest.update(relative_path)
+        digest.update(bytes.fromhex(file_sha256(path)))
+    return digest.hexdigest()
+
+
+def atomic_json(path: Path, value: Any, *, indent: int | None = 2) -> None:
     """Replace one JSON record only after the new complete record is flushed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
         try:
-            json.dump(value, stream, indent=2, allow_nan=False)
+            json.dump(value, stream, indent=indent, allow_nan=False,
+                      separators=(",", ":") if indent is None else None)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -51,13 +79,7 @@ def append_json(path: Path, value: Any) -> None:
 
 def provenance() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[3]
-    digest = hashlib.sha256()
-    for path in sorted((root / "src" / "carryrl").rglob("*.py")):
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
-    lock = root / "uv.lock"
-    if lock.exists():
-        digest.update(lock.read_bytes())
+    source_digest = _source_and_lock_sha256(root)
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
                             text=True, check=False)
     dirty = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True,
@@ -65,7 +87,8 @@ def provenance() -> dict[str, Any]:
     return {
         "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
         "git_dirty": dirty.stdout.splitlines() if dirty.returncode == 0 else None,
-        "source_and_lock_sha256": digest.hexdigest(),
+        "source_and_lock_sha256": source_digest,
+        "source_identity_version": SOURCE_IDENTITY_VERSION,
         "dependencies": {name: version(name) for name in
                          ("torch", "stable-baselines3", "gymnasium", "numpy", "pillow")},
         "torch_mps_available": torch.backends.mps.is_available(),

@@ -1,0 +1,662 @@
+{
+  "version": "carryrl.atomic_public_controls.v2",
+  "purpose": "Offline annotation source only; never a runtime task-to-control lookup.",
+  "sources": [
+    "src/carryrl/envs/atomic.py",
+    "src/carryrl/envs/atomic_motion.py",
+    "src/carryrl/envs/atomic_interaction.py",
+    "src/carryrl/envs/atomic_combat.py"
+  ],
+  "semantics": {
+    "complete": "Only a declared complete list makes omitted physical inputs unsupported.",
+    "groups": "Candidates in one group are equivalent aliases globally; different named operations are distinct.",
+    "held": "An input continues on each control interval; relative mouse deltas use the relative mode in the factorized protocol.",
+    "press": "A new activation edge after release is required.",
+    "when": "Offline condition metadata only. A described conditional control is globally supported without observing the current condition. Runtime text inference does not extract or resolve conditions.",
+    "applicability": "Global applicability to the game, not current executability in a particular frame.",
+    "unspecified": "An omitted property stays semantically unspecified and does not erase other known properties."
+  },
+  "games": {
+    "navigation": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "reaction": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "mouse": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "dx:-",
+          "candidates": [
+            "dx:-"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dx:+",
+          "candidates": [
+            "dx:+"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dy:-",
+          "candidates": [
+            "dy:-"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dy:+",
+          "candidates": [
+            "dy:+"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "click",
+          "candidates": [
+            "mouse:left"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "memory": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "timing": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "flap",
+          "candidates": [
+            "key:space"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "platforming": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "jump",
+          "candidates": [
+            "key:space"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "steering": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "camera": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dx:-",
+          "candidates": [
+            "dx:-"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dx:+",
+          "candidates": [
+            "dx:+"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dy:-",
+          "candidates": [
+            "dy:-"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dy:+",
+          "candidates": [
+            "dy:+"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "interaction": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "interact",
+          "candidates": [
+            "key:e"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "causality": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "interact",
+          "candidates": [
+            "key:e"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "key_door": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "interact",
+          "candidates": [
+            "key:e"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "goal_choice": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "hazards": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        }
+      ]
+    },
+    "shooting": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dx:-",
+          "candidates": [
+            "dx:-"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dx:+",
+          "candidates": [
+            "dx:+"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dy:-",
+          "candidates": [
+            "dy:-"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "dy:+",
+          "candidates": [
+            "dy:+"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "click",
+          "candidates": [
+            "mouse:left"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "ui": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held",
+          "when": {
+            "layout": 0,
+            "description": "horizontal menu"
+          }
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held",
+          "when": {
+            "layout": 0,
+            "description": "horizontal menu"
+          }
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held",
+          "when": {
+            "layout": 1,
+            "description": "vertical menu"
+          }
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held",
+          "when": {
+            "layout": 1,
+            "description": "vertical menu"
+          }
+        },
+        {
+          "name": "tab",
+          "candidates": [
+            "key:tab"
+          ],
+          "mode": "press"
+        },
+        {
+          "name": "enter",
+          "candidates": [
+            "key:enter"
+          ],
+          "mode": "press"
+        },
+        {
+          "name": "escape",
+          "candidates": [
+            "key:escape"
+          ],
+          "mode": "press"
+        }
+      ]
+    },
+    "chain": {
+      "complete": true,
+      "groups": [
+        {
+          "name": "left",
+          "candidates": [
+            "key:left",
+            "key:a"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "right",
+          "candidates": [
+            "key:right",
+            "key:d"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "up",
+          "candidates": [
+            "key:up",
+            "key:w"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "down",
+          "candidates": [
+            "key:down",
+            "key:s"
+          ],
+          "mode": "held"
+        },
+        {
+          "name": "interact",
+          "candidates": [
+            "key:e"
+          ],
+          "mode": "press"
+        }
+      ]
+    }
+  }
+}

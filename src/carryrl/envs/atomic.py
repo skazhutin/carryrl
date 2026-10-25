@@ -25,8 +25,10 @@ from carryrl.envs.atomic_suite import (
     get_extra_controller,
     get_extra_game,
 )
+from carryrl.envs.curriculum import constructor_parameters, resolve_effective_level
 from carryrl.envs.navigation import level_banks
 from carryrl.envs.presentation import PresentationConfig, choose_presentation, present_frame
+from carryrl.evaluation.quality import QUALITY_VERSION, command_input_units
 from carryrl.rewards.navigation import shortest_distance
 from carryrl.rewards.visual import HUD_HEIGHT, draw_visible_hud, verify_visible_outcome
 
@@ -99,8 +101,7 @@ def _navigation_action_units(action: PhysicalAction) -> int:
     ticks alone are not a comparable path-length metric. Blocked arrows still
     cost a unit; noops and every unused keyboard/mouse component cost too.
     """
-    return max(1, len(action.keys) + len(action.mouse_buttons)
-               + int(bool(action.dx)) + int(bool(action.dy)) + int(bool(action.wheel)))
+    return max(1, command_input_units(action))
 
 
 def _identity(level: dict) -> str:
@@ -322,7 +323,8 @@ class AtomicEnv:
 
     def __init__(self, task: str, split: str = "train", image_size: int = 96, max_steps: int = 80,
                  visual_config: PresentationConfig | dict | None = None,
-                 difficulty: float = 1.0, level_bank_seed: int = 0):
+                 difficulty: float = 1.0, level_bank_seed: int = 0,
+                 curriculum_stage: str | None = None):
         if task not in TASKS or split not in SPLITS:
             raise ValueError("Unknown task or data split")
         if isinstance(image_size, bool) or not isinstance(image_size, int) or image_size < 64:
@@ -334,6 +336,11 @@ class AtomicEnv:
             raise ValueError("difficulty must be a finite number in [0, 1]")
         if type(level_bank_seed) is not int or not 0 <= level_bank_seed < 2**32:
             raise ValueError("level_bank_seed must be an integer in [0, 2**32)")
+        if curriculum_stage is not None:
+            from carryrl.envs.curriculum import STAGES
+            if curriculum_stage not in STAGES or split != "train" or difficulty != 1:
+                raise ValueError("Task curriculum stages require TRAIN and difficulty=1")
+        self.curriculum_stage = curriculum_stage
         if isinstance(visual_config, dict):
             visual_config = PresentationConfig(**visual_config)
         if visual_config is not None and not isinstance(visual_config, PresentationConfig):
@@ -367,12 +374,16 @@ class AtomicEnv:
         original_level = bank[level_index]
         self._level_id = _identity(original_level)
         self._semantic_level_id = atomic_semantic_level_id(self.task, original_level)
-        self._level = _easier_level(self.task, original_level, self.difficulty)
+        self._level = resolve_effective_level(
+            self.task, original_level, difficulty=self.difficulty,
+            curriculum_stage=self.curriculum_stage)
+        self._constructor_parameters = constructor_parameters(
+            self.task, self._level, self.difficulty)
         self._effective_level_id = _identity(self._level)
         style_seed = seed if seed is not None else self._visual_episode
         self._visual_episode += 1
         self.presentation = choose_presentation(self.visual_config, self.split,
-                                                style_seed, self._canonical_size)
+                                                style_seed, self._canonical_size, task=self.task)
         self.image_size = (
             self.presentation.native_size if self.presentation else self._canonical_size
         )
@@ -383,6 +394,7 @@ class AtomicEnv:
         self.observation_space = spaces.Box(0, 255, (height, width, 3), np.uint8)
         self._ticks, self._score, self._status = 0, 0, "Play"
         self._unnecessary_inputs, self._navigation_units = 0, 0
+        self._input_units, self._neutral_commands = 0, 0
         self._previous_buttons = ()
         self._done, self._initialized = False, True
         if self.task == "navigation":
@@ -395,7 +407,7 @@ class AtomicEnv:
             self._ball_y = float(HUD_HEIGHT + 5)
             self._ball_dx = self._level["ball_dx"] * scale
             self._paddle_x = self._level["paddle_x"] * scale
-            self._reaction_drop = 2.5
+            self._reaction_drop = self._constructor_parameters["reaction_drop"]
             if self.image_size != 96:
                 # Scale the actual start-to-catch distance so native rendering
                 # and presentation profiles share the canonical round duration.
@@ -403,20 +415,20 @@ class AtomicEnv:
                     96 - HUD_HEIGHT - 17
                 )
             self._hits = 0
-            self._required_hits = 1 + math.ceil(2 * self.difficulty)
-            self._paddle_radius = 10 + round(8 * (1 - self.difficulty))
+            self._required_hits = self._constructor_parameters["required_hits"]
+            self._paddle_radius = self._constructor_parameters["paddle_radius"]
         elif self.task == "mouse":
             self._cursor = list(self._mouse_location(self._level["cursor"]))
             self._target_index = 0
-            self._required_targets = 1 + math.ceil(2 * self.difficulty)
-            self._mouse_radius = 8 + round(4 * (1 - self.difficulty))
+            self._required_targets = self._constructor_parameters["required_targets"]
+            self._mouse_radius = self._constructor_parameters["mouse_radius"]
             self._misses = 0
-            self._miss_limit = 1 + round(4 * (1 - self.difficulty))
-            if self.difficulty < 0.5:
+            self._miss_limit = self._constructor_parameters["miss_limit"]
+            if self._constructor_parameters["cursor_distance"] is not None:
                 target = self._mouse_location(self._level["targets"][0])
                 dx, dy = self._cursor[0] - target[0], self._cursor[1] - target[1]
                 distance = max(1, np.hypot(dx, dy))
-                remaining = 14 + 30 * self.difficulty
+                remaining = self._constructor_parameters["cursor_distance"]
                 self._cursor = [target[0] + dx * min(1, remaining / distance),
                                 target[1] + dy * min(1, remaining / distance)]
         elif self.task == "memory":
@@ -443,6 +455,9 @@ class AtomicEnv:
         horizontal = int(bool(keys & {"right", "d"})) - int(bool(keys & {"left", "a"}))
         vertical = int(bool(keys & {"down", "s"})) - int(bool(keys & {"up", "w"}))
         self._ticks += 1
+        input_units = command_input_units(action)
+        self._input_units += input_units
+        self._neutral_commands += int(input_units == 0)
         self._unnecessary_inputs += _unnecessary_input_units(
             self.task, action, self._level.get("layout")
         )
@@ -555,9 +570,15 @@ class AtomicEnv:
         )
         return self._frame.copy(), float(reward), terminated, truncated, self._info(visible)
 
+    def _curriculum_runtime_id(self):
+        from carryrl.envs.runtime_identity import atomic_runtime_level_id
+        return atomic_runtime_level_id(
+            self.task, self._level, curriculum_stage="full")
+
     def _info(self, visible: dict) -> dict:
-        return {
+        info = {
             **visible,
+            "quality": self._quality(visible),
             "suite_version": SUITE_VERSION,
             "scoring_version": SCORING_VERSION,
             "unnecessary_input_units": self._unnecessary_inputs,
@@ -574,7 +595,9 @@ class AtomicEnv:
             "level_id": self._level_id,
             "effective_level_id": self._effective_level_id,
             "semantic_level_id": self._semantic_level_id,
-            "runtime_fingerprint": self._semantic_level_id if self.difficulty == 1 else None,
+            "runtime_fingerprint": (
+                self._curriculum_runtime_id() if self.curriculum_stage is not None
+                else self._semantic_level_id if self.difficulty == 1 else None),
             "level_bank_seed": self.level_bank_seed,
             "level_index": self._level_index,
             "difficulty": self.difficulty,
@@ -585,6 +608,49 @@ class AtomicEnv:
             "action_ticks": 1,
             "tick_seconds": TICK_SECONDS,
             "reward_source": "diagnostic exact visible HUD; ignore in primary learned-reward PPO",
+        }
+
+        if self.curriculum_stage is not None:
+            info.update(curriculum_stage=self.curriculum_stage,
+                        effective_parameters=self._level)
+        return info
+
+    def _quality(self, visible: dict) -> dict:
+        """Evaluator-only diagnostics; never fed to the RGB policy or reward model."""
+        command_units = self._input_units + self._neutral_commands
+        success = visible.get("known") and visible.get("success") is True
+        completed_navigation = self.task == "navigation" and success
+        payoff = None
+        if self.task == "goal_choice" and visible.get("known"):
+            if success:
+                # The HUD can cap 5 to 4 for irrelevant inputs. Preserve the
+                # earned goal payoff separately from that visible quality score.
+                payoff = int(self._game.score)
+            elif visible.get("failure"):
+                payoff = 0
+        return {
+            "quality_version": QUALITY_VERSION,
+            "task": self.task,
+            "source": "diagnostic environment accounting; not policy/reward input",
+            "game_seconds": self._ticks * TICK_SECONDS,
+            "commands": self._ticks,
+            "active_commands": self._ticks - self._neutral_commands,
+            "neutral_commands": self._neutral_commands,
+            "input_units": self._input_units,
+            "command_units": command_units,
+            "unnecessary_input_units": self._unnecessary_inputs,
+            "optimal_command_units": (self._initial_distance
+                                      if self.task == "navigation" else None),
+            "excess_command_units": (command_units - self._initial_distance
+                                     if completed_navigation else None),
+            "completion_efficiency": (self._initial_distance / command_units
+                                      if completed_navigation else None),
+            "terminal_payoff": payoff,
+            "hits": (self._hits if self.task == "reaction" else
+                     self._target_index if self.task == "mouse" else
+                     self._game.hits if self.task == "shooting" else None),
+            "misses": (self._misses if self.task == "mouse" else
+                       self._game.misses if self.task == "shooting" else None),
         }
 
     def _draw_canonical(self) -> np.ndarray:
@@ -715,6 +781,7 @@ def collect_bootstrap_dataset(
     max_steps: int = 80,
     tasks: tuple[str, ...] | list[str] | None = None,
     difficulty: float = 1.0,
+    level_bank_seed: int = 0,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict]:
     """Collect whole scripted pixel-only probe episodes, including failure/timeout cases.
 
@@ -724,6 +791,8 @@ def collect_bootstrap_dataset(
     """
     if episodes_per_task < 2:
         raise ValueError("Use at least two episodes per task to probe both outcomes")
+    if type(level_bank_seed) is not int or not 0 <= level_bank_seed < 2**32:
+        raise ValueError("level_bank_seed must be an integer in [0, 2**32)")
     selected = TASKS if tasks is None else tuple(tasks)
     if not selected or len(set(selected)) != len(selected) or any(t not in TASKS for t in selected):
         raise ValueError("Bootstrap tasks must be a nonempty unique supported selection")
@@ -735,7 +804,8 @@ def collect_bootstrap_dataset(
     )
     for task in selected:
         task_index = TASKS.index(task)
-        env = AtomicEnv(task, split, image_size, max_steps, difficulty=difficulty)
+        env = AtomicEnv(task, split, image_size, max_steps, difficulty=difficulty,
+                        level_bank_seed=level_bank_seed)
         for episode in range(episodes_per_task):
             episode_seed = seed + 10000 * task_index + episode
             frame, info = env.reset(seed=episode_seed)
@@ -802,6 +872,7 @@ def collect_bootstrap_dataset(
                     "task": task,
                     "split": split,
                     "level_id": info["level_id"],
+                    "level_bank_seed": level_bank_seed,
                     "seed": episode_seed,
                     "strategy": "scripted pixel-only failure/timeout probe"
                     if fail
@@ -817,6 +888,7 @@ def collect_bootstrap_dataset(
     arrays = {name: np.asarray(values, np.float32) for name, values in labels.items()}
     provenance = {
         "split": split,
+        "level_bank_seed": level_bank_seed,
         "suite_version": SUITE_VERSION,
         "scoring_version": SCORING_VERSION,
         "tasks": list(selected),

@@ -91,6 +91,35 @@ def test_disabled_noninterval_incomplete_and_final_epochs_do_no_extra_work(
     assert not (tmp_path / "checkpoints_by_epoch").exists()
 
 
+@pytest.mark.parametrize("mismatch", [None, "agent_sha256", "checkpoint_weights_revision"])
+def test_snapshot_links_only_matching_frozen_validation_likelihood(monkeypatch, tmp_path, mismatch):
+    args = _snapshot_arguments(tmp_path)
+    manifest = {"sha256": "archive", "agent_sha256": "agent", "reward_sha256": "reward",
+                "weights_revision": 207}
+
+    def save(*positional, **keywords):
+        checkpoint = tmp_path / "checkpoints_by_epoch/epoch_0020/checkpoints/rollout_0000"
+        checkpoint.mkdir(parents=True)
+        atomic_json(checkpoint / "manifest.json", manifest)
+        return checkpoint
+
+    monkeypatch.setattr(script, "save_sequence_checkpoint", save)
+    likelihood = {"agent_sha256": "agent", "reward_sha256": "reward",
+                  "checkpoint_weights_revision": 207}
+    if mismatch:
+        likelihood[mismatch] = "wrong"
+    reference = tmp_path / "validation_likelihood/epoch_0020.json"
+    atomic_json(reference, likelihood)
+    row = {"complete": True, "epoch": 20, "optimizer_steps": 200}
+    if mismatch:
+        with pytest.raises(RuntimeError, match="frozen validation likelihood"):
+            script._save_epoch_snapshot(row, **args)
+    else:
+        checkpoint = script._save_epoch_snapshot(row, **args)
+        saved = json.loads((checkpoint / "manifest.json").read_text())
+        assert saved["validation_likelihood_reference"] == str(reference.resolve())
+
+
 @pytest.mark.parametrize("failed_stage", ["sync", "save"])
 def test_snapshot_failure_persists_original_error_without_recovery_retry(
         monkeypatch, tmp_path, failed_stage):
@@ -232,9 +261,12 @@ def test_main_closes_writer_once_before_reporting_completion(monkeypatch, tmp_pa
                             encode_frames=lambda _: torch.zeros(1, 1, 384))
     optimizer, reward = SimpleNamespace(param_groups=[{}]), object()
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
-        (agent, optimizer, reward, {"decisions": 123, "weights_revision": 7}))
+        (agent, optimizer, reward, {"decisions": 123, "weights_revision": 7,
+                                   "config": config.to_dict()}))
     monkeypatch.setattr(script, "tensor_hash", lambda _: "stable tensor hash")
     monkeypatch.setattr(script, "collect_scripted_demonstrations", lambda *a, **k: dataset)
+    # Corpus admission is tested separately; this dataset models writer lifecycle.
+    monkeypatch.setattr(script, "validate_dataset_runtime_holdout", lambda *a, **k: None)
     monkeypatch.setattr(script, "evaluate_sequence", lambda *a, **k: {"summaries": {
         "frozen_deterministic": {"outcomes": {"success": 0}, "episodes_started": 1,
                                  "tasks": {"navigation": {"success_rate_lower": 0.0}}}}})
@@ -318,14 +350,16 @@ def test_main_real_frozen_evaluation_and_checkpoint_identities_match(monkeypatch
     optimizer = torch.optim.AdamW(parameter for parameter in agent.parameters()
                                   if parameter.requires_grad)
     config = SequenceRunConfig(agent=agent.config, tasks=("navigation",),
-                               max_episode_steps=1, eval_episodes_per_task=1)
+                               max_episode_steps=1, eval_episodes_per_task=1,
+                               max_grad_norm=0.125)
     source, output = tmp_path / "source", tmp_path / "run"
     source.mkdir()
     atomic_json(source / "manifest.json", {"sha256": "source archive hash"})
     monkeypatch.setattr(script.SequenceRunConfig, "load", lambda _: config)
     monkeypatch.setattr(script, "provenance", lambda: {})
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
-        (agent, optimizer, reward, {"decisions": 123, "weights_revision": 7}))
+        (agent, optimizer, reward, {"decisions": 123, "weights_revision": 7,
+                                   "config": config.to_dict()}))
 
     class Episode:
         frame_indices = (0,)
@@ -342,9 +376,13 @@ def test_main_real_frozen_evaluation_and_checkpoint_identities_match(monkeypatch
         provenance=lambda: {"source": "stub train-only RGB"})
     monkeypatch.setattr(script, "collect_scripted_demonstrations", lambda *a, **k: dataset)
     monkeypatch.setattr(script, "write_frozen_playback", lambda *a, **k: None)
+    # Keep this fixture focused on frozen reports and checkpoint identities.
+    monkeypatch.setattr(script, "validate_dataset_runtime_holdout", lambda *a, **k: None)
     # Keep real evaluate_sequence, tensor_hash and save_sequence_checkpoint. The training
     # stub performs real CPU optimizer updates and invokes the production epoch callbacks.
     def train(*args, **kwargs):
+        # A nondefault clipping budget must reach the optimizer implementation.
+        assert kwargs["max_grad_norm"] == config.max_grad_norm == 0.125
         for epoch in (1, 2):
             optimizer.zero_grad()
             agent.decoder.key_head.weight.square().sum().backward()
@@ -359,7 +397,8 @@ def test_main_real_frozen_evaluation_and_checkpoint_identities_match(monkeypatch
     monkeypatch.setattr(script, "train_imitation", train)
     monkeypatch.setattr(sys, "argv", ["train_imitation.py", "--config", "unused.json",
         "--warm-start", str(source), "--output", str(output), "--training-backend", "torch",
-        "--epochs", "2", "--eval-every", "1", "--checkpoint-every", "1"])
+        "--epochs", "2", "--eval-every", "1", "--checkpoint-every", "1",
+        "--validation-nll", "--validation-nll-episodes-per-task", "1"])
     script.main()
     evaluation = json.loads((output / "evaluations" / "epoch_0001.json").read_text())
     checkpoint = output / "checkpoints_by_epoch" / "epoch_0001" / "checkpoints" / "rollout_0000"
@@ -371,6 +410,15 @@ def test_main_real_frozen_evaluation_and_checkpoint_identities_match(monkeypatch
         assert evaluation[key] == manifest[key]
     assert evaluation["reward_sha256"] == tensor_hash(reward)
     assert evaluation["weights_revision"] == archive["weights_revision"] == 8
+    likelihood = json.loads((output / "validation_likelihood/epoch_0001.json").read_text())
+    assert likelihood["checkpoint_weights_revision"] == 8
+    for key in ("agent_sha256", "reward_sha256"):
+        assert likelihood[key] == manifest[key]
+    assert manifest["validation_likelihood_reference"] == str(
+        (output / "validation_likelihood/epoch_0001.json").resolve())
+    assert sorted(path.name for path in (output / "validation_likelihood").glob("*.json")) == [
+        "epoch_0000.json", "epoch_0001.json", "epoch_0002.json"]
+    assert likelihood["protocol"]["counts"] == {"navigation": 1}
     assert manifest["epoch"] == manifest["optimizer_steps"] == 1
     assert manifest["evaluation_reference"] == str(
         (output / "evaluations" / "epoch_0001.json").resolve())

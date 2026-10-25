@@ -30,7 +30,7 @@ def _episode(env, index, digest=None):
             # outcome. Exclude only the additive, versioned efficiency diagnostics.
             historical_info = {key: value for key, value in info.items() if key not in {
                 "scoring_version", "unnecessary_input_units", "efficiency_scope",
-                "optimal_action_units", "action_units", "completion_efficiency",
+                "optimal_action_units", "action_units", "completion_efficiency", "quality",
             }}
             digest.update(frame.tobytes())
             digest.update(repr((reward, terminated, truncated, historical_info)).encode())

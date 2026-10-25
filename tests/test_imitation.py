@@ -62,9 +62,10 @@ def make_agent(*, instruction=False, segment_length=2):
                            language=TinyLanguage() if instruction else None)
 
 
-@pytest.mark.parametrize("difficulty", [0.0, 1.0])
-def test_all16_teacher_demonstrations_pass_visible_quality_gate_on_train(difficulty):
-    dataset = collect_scripted_demonstrations(2, difficulty=difficulty)
+def test_all16_teacher_demonstrations_pass_visible_quality_gate_on_train():
+    # Simplified platforming collapses train/held-out mechanics and is rejected
+    # before collection; all-sixteen quality coverage uses separated full levels.
+    dataset = collect_scripted_demonstrations(2, difficulty=1.0)
     assert len(dataset.episodes) == 32
     assert {episode.task for episode in dataset.episodes} == set(TASKS)
     for episode in dataset.episodes:
@@ -447,16 +448,20 @@ def test_executed_history_conditions_policy_without_changing_teacher_targets(mon
     labels = [PhysicalAction(keys=("right",))] * 5
     executed = [PhysicalAction(keys=("left",))] * 5
     observed = []
+    observed_previous = []
     decode = agent.decoder.evaluate
 
-    def record(features, actions):
+    def record(features, actions, *, previous_actions=None):
         observed.append(list(actions))
-        return decode(features, actions)
+        observed_previous.append(previous_actions)
+        return decode(features, actions, previous_actions=previous_actions)
 
     monkeypatch.setattr(agent.decoder, "evaluate", record)
     baseline = agent.evaluate_episode(patches, labels)
     correction = agent.evaluate_episode(patches, labels, executed_actions=executed)
     assert observed == [labels, labels]
+    assert observed_previous == [[PhysicalAction(), *labels[:-1]],
+                                 [PhysicalAction(), *executed[:-1]]]
     torch.testing.assert_close(baseline["value"][:1], correction["value"][:1])
     assert not torch.allclose(baseline["value"][1:], correction["value"][1:])
     changed_last = agent.evaluate_episode(patches, labels,
@@ -919,7 +924,8 @@ def test_live_styled_corrections_separate_live_rgb_and_preserve_executed_history
         assert previous == (PhysicalAction() if step == 0 else episode.executed_actions[step - 1])
     assert dataset.provenance()["live_styled_corrections"]["episodes"] == 1
     assert episode.to_dict()["appearance_application"] == "live environment learner rollout"
-    legacy = replace(episode, collection_type=None, scoring_version=None)
+    legacy = replace(episode, collection_type=None, scoring_version=None,
+                     quality=None, quality_source=None)
     assert legacy.effective_scoring_version == "legacy.v0"
     assert "scoring_version" not in legacy.to_dict()
 
@@ -967,7 +973,8 @@ def test_live_styled_excludes_semantic_heldout_matches_from_additional_bank(monk
         return banks
 
     monkeypatch.setattr(imitation, "atomic_level_banks", overlapping)
-    with pytest.raises(ValueError, match="without held-out semantic matches"):
+    monkeypatch.setattr("carryrl.envs.runtime_identity.atomic_level_banks", overlapping)
+    with pytest.raises(ValueError, match="without held-out matches"):
         collect_scripted_corrections(CorrectionLearner(PhysicalAction()), 1,
             tasks=("navigation",), level_bank_seed=20261009,
             presentation_config=PresentationConfig(mode="varied", native_sizes=(96,),
@@ -1337,7 +1344,8 @@ def test_memory_counterpart_rejects_forged_origin_runtime_source_reward_and_rgb(
         pairs.add_episode(replace(episode, outcome={**episode.outcome, "reward": 1}))
     with pytest.raises(ValueError, match="neutral-wait RGB teacher"):
         pairs.add_episode(replace(episode, actions=(PhysicalAction(keys=("left",)),
-                                                   *episode.actions[1:])))
+                                                   *episode.actions[1:]),
+                                  quality=None, quality_source=None))
     wrong = pairs.intern_frame(origins.frames[origins.episodes[0].frame_indices[0]])
     with pytest.raises(ValueError, match="trace RGB"):
         pairs.add_episode(replace(episode, frame_indices=(wrong, *episode.frame_indices[1:])))
@@ -1373,7 +1381,8 @@ def test_memory_counterpart_collection_quality_gate_and_origin_trace_are_not_wea
         collect_memory_cue_counterparts(origins, teacher_factory=lambda _: IdleTeacher())
     original = origins.episodes[0]
     origins.episodes[0] = replace(original,
-        actions=(PhysicalAction(keys=("left",)), *original.actions[1:]))
+        actions=(PhysicalAction(keys=("left",)), *original.actions[1:]),
+        quality=None, quality_source=None)
     with pytest.raises(ValueError, match="neutral-wait RGB teacher"):
         collect_memory_cue_counterparts(origins)
     for invalid in (-1, 0, 65, True):

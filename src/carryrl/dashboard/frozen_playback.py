@@ -17,12 +17,15 @@ from PIL import Image
 from carryrl.agent.actions import CODEC_VERSION
 from carryrl.agent.model import GeneralistAgent
 from carryrl.envs.atomic import AtomicEnv, verify_visible_outcome
+from carryrl.training.checkpoint_storage import checkpoint_read_lock
 from carryrl.training.run import atomic_json
 from carryrl.training.sequence import (
     _environment_options,
     _episode_instruction,
     _language_metadata,
     _language_resource_hashes,
+    _validate_checkpoint_reward_composition,
+    configure_screen_text,
     tensor_hash,
 )
 from carryrl.training.sequence_config import SequenceRunConfig
@@ -148,6 +151,11 @@ def link_matching_playbacks(run: Path, checkpoint: Path, manifest: dict):
 
 def load_frozen_agent(checkpoint: Path):
     """Load a strict offline graph and resources without constructing an optimizer."""
+    with checkpoint_read_lock(checkpoint):
+        return _load_frozen_agent(checkpoint)
+
+
+def _load_frozen_agent(checkpoint: Path):
     manifest = json.loads((checkpoint / "manifest.json").read_text())
     if sha256_file(checkpoint / "state.pt") != manifest["sha256"]:
         raise ValueError("checkpoint archive SHA256 mismatch")
@@ -155,6 +163,7 @@ def load_frozen_agent(checkpoint: Path):
     if state.get("format") != "carryrl.sequence.v1" or state.get("codec_version") != CODEC_VERSION:
         raise ValueError("unsupported sequence checkpoint format or codec")
     config = SequenceRunConfig.from_dict(state["config"])
+    _validate_checkpoint_reward_composition(state, manifest, config)
     if (state.get("weights_revision") != manifest.get("weights_revision")
             or manifest.get("codec_version") != CODEC_VERSION
             or state.get("training_backend", "torch") != config.training_backend
@@ -179,6 +188,7 @@ def load_frozen_agent(checkpoint: Path):
     agent.eval().requires_grad_(False)
     if tensor_hash(agent) != manifest["agent_sha256"]:
         raise ValueError("checkpoint agent tensor SHA256 mismatch")
+    configure_screen_text(agent, config)
     return agent, config, manifest
 
 
@@ -195,6 +205,8 @@ def export_run(run: Path, tasks: tuple[str, ...] | None = None) -> list[Path]:
     if not evaluations:
         raise ValueError("no frozen evaluation matches the saved agent")
     epoch, reference_path, reference = max(evaluations, key=lambda row: row[0])
+    if reference.get("protocol", {}).get("screen_text_language") != config.screen_text_language:
+        raise ValueError("playback OCR input mode differs from its evaluation reference")
     tasks = tasks or config.tasks
     if any(task not in config.tasks for task in tasks):
         raise ValueError("requested task is outside the checkpoint task suite")
@@ -211,6 +223,7 @@ def export_run(run: Path, tasks: tuple[str, ...] | None = None) -> list[Path]:
             gif_path = destination.with_suffix(".gif")
             if (existing.get("agent_sha256") != manifest["agent_sha256"]
                     or existing.get("checkpoint_sha256") != manifest["sha256"]
+                    or existing.get("screen_text_language") != config.screen_text_language
                     or sha256_file(gif_path) != existing.get("gif_sha256")):
                 raise ValueError(f"existing playback verification failed: {destination}")
             paths.append(destination)
@@ -221,9 +234,15 @@ def export_run(run: Path, tasks: tuple[str, ...] | None = None) -> list[Path]:
         try:
             agent.reset_episode(instruction=instruction)
             frame, info = env.reset(seed=expected["seed"], options={"level_index": 0})
-            frames, actions = [frame.copy()], []
+            frames, actions, screen_observations = [frame.copy()], [], []
             for _ in range(config.max_episode_steps):
                 action = agent.act(frame, deterministic=True).action
+                if config.screen_text_language is not None:
+                    from carryrl.perception.screen_text import format_model_text
+
+                    observed = agent.last_screen_text_result
+                    screen_observations.append({**observed.to_dict(),
+                                                "model_text": format_model_text(observed)})
                 frame, _, terminated, truncated, _ = env.step(action)
                 frames.append(frame.copy())
                 actions.append(action.to_dict())
@@ -250,6 +269,9 @@ def export_run(run: Path, tasks: tuple[str, ...] | None = None) -> list[Path]:
             row = json.loads(path.read_text())
             row.update(optimizer_constructed=False, device="cpu", torch_threads=2,
                        final_agent_sha256=manifest["agent_sha256"])
+            if config.screen_text_language is not None:
+                row.update(screen_text_language=config.screen_text_language,
+                           screen_text=screen_observations)
             atomic_json(path, row)
             paths.append(path)
             print(json.dumps({"task": task, "epoch": epoch, "steps": len(actions),

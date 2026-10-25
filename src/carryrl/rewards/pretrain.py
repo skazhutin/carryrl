@@ -282,6 +282,7 @@ def pretrain_screen_reward(
     validation_episodes_per_task: int = 2, epochs: int = 40, seed: int = 0,
     device: str = "cpu", image_size: int = 96, max_steps: int = 80,
     presentation_config=None, gate: RewardGate | None = None,
+    level_bank_seed: int = 0,
 ) -> tuple[ScreenVisualReward, dict]:
     """Split complete canonical episodes first, then augment only their RGB.
 
@@ -318,6 +319,7 @@ def pretrain_screen_reward(
             size: collect_bootstrap_dataset(
                 episodes_per_task=count, seed=seed + offset, image_size=size, split=split,
                 max_steps=max_steps, tasks=selected,
+                level_bank_seed=level_bank_seed,
             ) for size in config.native_sizes
         }
     fitted = _augment(canonical["train"], train_themes, config)
@@ -367,6 +369,8 @@ def pretrain_screen_reward(
     ]
     report = {
         "model_version": SCREEN_REWARD_VERSION, "tasks": list(selected), "seed": seed,
+        "level_bank_seed": level_bank_seed,
+        "initialization": "random", "imported_checkpoints": [], "old_corpora": [],
         "image_size": image_size, "presentation_config": asdict(config),
         "train_themes": list(train_themes), "heldout_themes": list(unseen_themes),
         "supervision": "independent exact RGB verification of ordinary supported HUDs",

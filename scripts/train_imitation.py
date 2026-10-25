@@ -11,7 +11,6 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import datetime
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -20,7 +19,7 @@ import torch
 
 from carryrl.dashboard.frozen_playback import link_matching_playbacks, write_frozen_playback
 from carryrl.envs.atomic_suite import SUITE_VERSION, TASKS
-from carryrl.envs.presentation import THEME_SPLITS, PresentationConfig
+from carryrl.envs.presentation import HUD_LAYOUTS, THEME_SPLITS, PresentationConfig
 from carryrl.training.feature_store import (
     FrozenFeatureReuse,
     FrozenFeatureStore,
@@ -28,6 +27,7 @@ from carryrl.training.feature_store import (
     feature_cache_identity,
 )
 from carryrl.training.imitation import (
+    ImitationScreenText,
     SavedDemonstrationReuse,
     audit_correction_replacement,
     augment_demonstrations,
@@ -38,16 +38,17 @@ from carryrl.training.imitation import (
     imitation_replay_summary,
     load_correction_replacement_bundle,
     train_imitation,
+    validate_dataset_runtime_holdout,
 )
 from carryrl.training.progress import TrainingProgress
-from carryrl.training.run import append_json, atomic_json, provenance
+from carryrl.training.retention import validate_initial_evaluation as _reuse_initial_evaluation
+from carryrl.training.run import append_json, atomic_json, file_sha256, provenance
 from carryrl.training.sequence import (
-    _episode_instruction,
+    _reward_composition_identity,
     evaluate_sequence,
     load_sequence_checkpoint,
     save_sequence_checkpoint,
     sequence_evaluation_protocol,
-    sequence_evaluation_summaries,
     tensor_hash,
 )
 from carryrl.training.sequence_config import SequenceRunConfig
@@ -217,6 +218,15 @@ def _save_epoch_snapshot(row, *, every, max_epochs, output, progress, agent, opt
             raise RuntimeError("epoch snapshot does not match its frozen evaluation")
         manifest["evaluation_reference"] = str(evaluation_path.resolve())
         atomic_json(manifest_path, manifest)
+    likelihood_path = output / "validation_likelihood" / f"epoch_{epoch:04d}.json"
+    if likelihood_path.exists():
+        likelihood = json.loads(likelihood_path.read_text())
+        if (likelihood.get("checkpoint_weights_revision") != manifest["weights_revision"]
+                or any(likelihood.get(key) != manifest[key]
+                       for key in ("agent_sha256", "reward_sha256"))):
+            raise RuntimeError("epoch snapshot does not match its frozen validation likelihood")
+        manifest["validation_likelihood_reference"] = str(likelihood_path.resolve())
+        atomic_json(manifest_path, manifest)
     progress.update(force=True, training_action="learning", last_epoch_checkpoint=str(checkpoint),
                     last_checkpoint_epoch=epoch,
                     last_checkpoint_evaluation_match=("matched" if evaluation_path.exists()
@@ -224,91 +234,21 @@ def _save_epoch_snapshot(row, *, every, max_epochs, output, progress, agent, opt
     return checkpoint
 
 
-def _reuse_initial_evaluation(source, *, checkpoint, config, agent_sha256, reward_sha256,
-                              weights_revision):
-    """Validate a prior measurement against this checkpoint and complete cohort."""
-    checkpoint = checkpoint.resolve(strict=True)
-    source = source.resolve(strict=True)
-    if (checkpoint.parent.name != "checkpoints"
-            or source.parent != (checkpoint.parent.parent / "evaluations").resolve()
-            or not source.is_file()):
-        raise ValueError("reused evaluation must belong to the warm-start run's evaluations")
-    manifest = json.loads((checkpoint / "manifest.json").read_text())
-    if (manifest.get("agent_sha256") != agent_sha256
-            or manifest.get("reward_sha256") != reward_sha256
-            or manifest.get("weights_revision") != weights_revision):
-        raise ValueError("reused evaluation checkpoint manifest does not match loaded weights")
-    source_bytes = source.read_bytes()
-    evaluated = json.loads(source_bytes)
-    protocol = sequence_evaluation_protocol(config)
-    protocol_hash = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
-    if (evaluated.get("split") != "validation"
-            or evaluated.get("policy_and_reward_frozen") is not True
-            or evaluated.get("agent_sha256") != agent_sha256
-            or evaluated.get("reward_sha256", reward_sha256) != reward_sha256
-            or evaluated.get("weights_revision") != weights_revision
-            or evaluated.get("evaluation_seed") != config.eval_seed
-            or evaluated.get("evaluation_difficulty") != protocol["difficulty"]
-            or evaluated.get("level_bank_seed") != config.level_bank_seed
-            or evaluated.get("protocol_sha256") != protocol_hash):
-        raise ValueError("reused evaluation policy or protocol does not match this run")
-    try:
-        measured_at = evaluated["created_utc"]
-        if datetime.fromisoformat(measured_at).tzinfo is None:
-            raise ValueError("evaluation timestamp must include its timezone")
-        records = evaluated["records"]
-        expected = {(policy, task, index)
-                    for policy in protocol["policies"] for task, count in protocol["counts"].items()
-                    for index in range(count)}
-        actual = [(row["policy"], row["task"], row["episode_index"]) for row in records]
-        if len(actual) != len(expected) or set(actual) != expected:
-            raise ValueError("reused evaluation has incomplete or duplicate episode records")
-        from carryrl.envs.atomic import _identity, atomic_level_banks, atomic_semantic_level_id
-
-        for row in records:
-            task, index = row["task"], row["episode_index"]
-            action_seed = (config.eval_seed + config.tasks.index(task) * 100_000 + index) % 2**32
-            if (row["seed"] != 1_000_000 + index or row["action_seed"] != action_seed
-                    or row["difficulty"] != protocol["difficulty"]
-                    or row["level_bank_seed"] != config.level_bank_seed
-                    or row["instruction"] != _episode_instruction(config, task, row["seed"])
-                    or not 1 <= row["steps"] <= config.max_episode_steps
-                    or not (row["terminated"] or row["truncated"])):
-                raise ValueError("reused evaluation episode metadata does not match its cohort")
-            if config.eval_all_levels:
-                bank = atomic_level_banks(task, config.level_bank_seed)["validation"]
-                level = bank[index % len(bank)]
-                if (row["level_index"] != index % len(bank)
-                        or row["level_id"] != _identity(level)
-                        or row["semantic_level_id"] != atomic_semantic_level_id(task, level)):
-                    raise ValueError("reused evaluation records do not cover the expected bank")
-        summaries = sequence_evaluation_summaries(
-            records, tasks=config.tasks, policies=protocol["policies"])
-        if evaluated["summaries"] != summaries:
-            raise ValueError("reused evaluation summaries are inconsistent with its records")
-    except (KeyError, TypeError, IndexError, ZeroDivisionError) as error:
-        raise ValueError("reused evaluation is malformed or incomplete") from error
-    evaluated.update(epoch=0, weights_revision=weights_revision,
-                     initial_evaluation_reuse={
-                         "source": str(source),
-                         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
-                         "source_created_utc": measured_at,
-                         "source_epoch": evaluated.get("epoch"),
-                         "source_weights_revision": evaluated["weights_revision"],
-                         "measurement_reused": True,
-                     })
-    return evaluated
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--warm-start", type=Path, required=True)
+    parser.add_argument("--allow-reward-composition-change", action="store_true",
+                        help="explicitly transfer to a different reward composition")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--training-backend", choices=("torch", "mlx"), default="mlx")
+    parser.add_argument("--screen-text-language", default=None,
+                        help="opt in to local RGB OCR using explicit Tesseract languages, e.g. eng")
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--episodes-per-task", type=int, default=16)
-    parser.add_argument("--difficulty", type=float, nargs="+", default=[0.0])
+    parser.add_argument("--difficulty", type=float, nargs="+", default=[1.0],
+                        help="training difficulties (default: 1); runtime train levels must "
+                             "remain separate from held-out levels after simplification")
     parser.add_argument("--evaluation-difficulty", type=float)
     parser.add_argument("--level-bank-seed", type=int)
     parser.add_argument("--correction-episodes-per-task", type=int, default=0)
@@ -326,6 +266,19 @@ def main():
     parser.add_argument("--styled-correction-expert-probability", type=float, default=0.35)
     parser.add_argument("--styled-correction-prefix-steps", type=int, default=4)
     parser.add_argument("--presentation-copies-per-episode", type=int, default=0)
+    parser.add_argument("--augmentation-themes", nargs="+", choices=THEME_SPLITS["train"],
+                        default=None, help="train themes for posthoc appearance copies")
+    parser.add_argument("--augmentation-hud-layouts", nargs="+", choices=HUD_LAYOUTS,
+                        default=None, help="HUD layouts for posthoc appearance copies")
+    parser.add_argument("--augmentation-textures", action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--augmentation-canvas-padding", type=int, default=8)
+    parser.add_argument("--navigation-geometry-pairs", type=int, default=0)
+    parser.add_argument("--navigation-geometry-mode", choices=("repeat", "new_walls"))
+    parser.add_argument("--runtime-diversity-axis",
+                        choices=("navigation_geometry", "reaction_dynamics"))
+    parser.add_argument("--runtime-diversity-pairs", type=int, default=0)
+    parser.add_argument("--runtime-diversity-arm", choices=("repeat", "varied"))
     parser.add_argument("--memory-cue-pairs", type=int, default=0)
     parser.add_argument("--native-train-sizes", type=int, nargs="+", choices=(64, 128), default=[])
     parser.add_argument("--native-episodes-per-task", type=int, default=0)
@@ -338,8 +291,19 @@ def main():
     parser.add_argument("--canonical-anchor-coefficient", type=float, default=0.0,
                         help="teacher-prefix conditional KL to the frozen initial policy on "
                              "canonical unstyled 96 RGB episodes (0 disables)")
+    parser.add_argument("--canonical-anchor-exclude-corrections", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="zero correction-episode anchor KL with the same canonical-episode "
+                             "denominator; BC and replay weights are unchanged")
     parser.add_argument("--minibatch-episodes", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--eval-all-levels", action="store_true", default=argparse.SUPPRESS,
+                        help="use every explicit validation level at --eval-every intervals "
+                             "(default: short evaluations)")
+    parser.add_argument("--validation-nll", action="store_true",
+                        help="measure frozen held-out teacher likelihood at gameplay evaluations; "
+                             "separate from training NLL and autonomous game wins")
+    parser.add_argument("--validation-nll-episodes-per-task", type=int, default=2)
     parser.add_argument("--checkpoint-every", type=int, default=0,
                         help="save completed epoch intervals (0 disables); the final requested "
                              "epoch uses the normal final checkpoint")
@@ -352,19 +316,76 @@ def main():
                         help="reuse compatible frozen RGB features; encode missing frames only")
     parser.add_argument("--demonstration-reuse-run", type=Path,
                         help="use the exact complete saved RGB/action corpus; skip all collection")
+    parser.add_argument("--appearance-bundle", type=Path,
+                        help="use a validated prepared appearance arm; skip all collection")
+    parser.add_argument("--appearance-bundle-sha256")
+    parser.add_argument("--appearance-arm", choices=("control", "theme_shift"))
     parser.add_argument("--final-all-levels", action="store_true")
     parser.add_argument("--reuse-initial-evaluation", type=Path)
     parser.add_argument("--tensorboard", type=Path)
     args = parser.parse_args()
+    # Keep historical prepared manifests' exact settings when the option is absent.
+    eval_all_levels = getattr(args, "eval_all_levels", False)
+    canonical_anchor_exclude_corrections = getattr(args, "canonical_anchor_exclude_corrections",
+                                                   False)
+    augmentation_flags = {"--augmentation-themes", "--augmentation-hud-layouts",
+                          "--augmentation-textures", "--no-augmentation-textures",
+                          "--augmentation-canvas-padding"}
+    collection_flags = {
+        "--episodes-per-task", "--difficulty", "--correction-episodes-per-task",
+        "--correction-tasks", "--expert-probability", "--learner-prefix-steps",
+        "--presentation-copies-per-episode", "--memory-cue-pairs", "--native-train-sizes",
+        "--native-episodes-per-task", "--correction-replacement-bundle",
+        "--correction-replacement-sha256", "--replacement-control-run",
+    } | augmentation_flags
+    supplied = {value.split("=", 1)[0] for value in sys.argv[1:]}
+    legacy_runtime_flags = {"--navigation-geometry-pairs", "--navigation-geometry-mode"}
+    runtime_flags = {"--runtime-diversity-axis", "--runtime-diversity-pairs",
+                     "--runtime-diversity-arm"}
+    if legacy_runtime_flags & supplied and runtime_flags & supplied:
+        parser.error("legacy navigation geometry and runtime diversity flags cannot be combined")
+    if (not 0 <= args.navigation_geometry_pairs <= 64
+            or bool(args.navigation_geometry_pairs) != bool(args.navigation_geometry_mode)):
+        parser.error("navigation geometry requires pairs in [1,64] and mode together")
+    if (not 0 <= args.runtime_diversity_pairs <= 64
+            or (bool(runtime_flags & supplied) and not (
+                args.runtime_diversity_axis and args.runtime_diversity_pairs
+                and args.runtime_diversity_arm))):
+        parser.error("runtime diversity requires axis, pairs in [1,64], and arm together")
+    diversity_axis = args.runtime_diversity_axis
+    diversity_pairs_count = args.runtime_diversity_pairs
+    diversity_arm = args.runtime_diversity_arm
+    legacy_geometry = bool(args.navigation_geometry_pairs)
+    if legacy_geometry:
+        diversity_axis = "navigation_geometry"
+        diversity_pairs_count = args.navigation_geometry_pairs
+        diversity_arm = "repeat" if args.navigation_geometry_mode == "repeat" else "varied"
+    if diversity_pairs_count:
+        incompatible = sorted(({
+            "--appearance-bundle", "--appearance-bundle-sha256", "--appearance-arm",
+            "--styled-correction-episodes-per-task", "--styled-correction-expert-probability",
+            "--styled-correction-prefix-steps", "--presentation-copies-per-episode",
+            "--correction-replacement-bundle", "--correction-replacement-sha256",
+            "--replacement-control-run", "--memory-cue-pairs", "--native-train-sizes",
+            "--native-episodes-per-task",
+        } | augmentation_flags) & supplied)
+        if incompatible:
+            parser.error("runtime diversity excludes other experimental collection controls: "
+                         + ", ".join(incompatible))
+    appearance_inputs = (args.appearance_bundle, args.appearance_bundle_sha256, args.appearance_arm)
+    if any(value is not None for value in appearance_inputs):
+        if not all(value is not None for value in appearance_inputs):
+            parser.error("appearance reuse requires bundle, trusted SHA256, and arm together")
+        incompatible = sorted((collection_flags | {
+            "--demonstration-reuse-run", "--feature-reuse-run",
+            *legacy_runtime_flags, *runtime_flags,
+            "--styled-correction-episodes-per-task", "--styled-correction-expert-probability",
+            "--styled-correction-prefix-steps",
+        }) & supplied)
+        if incompatible:
+            parser.error("appearance reuse excludes collection and saved reuse flags: "
+                         + ", ".join(incompatible))
     if args.demonstration_reuse_run is not None:
-        collection_flags = {
-            "--episodes-per-task", "--difficulty", "--correction-episodes-per-task",
-            "--correction-tasks", "--expert-probability", "--learner-prefix-steps",
-            "--presentation-copies-per-episode", "--memory-cue-pairs", "--native-train-sizes",
-            "--native-episodes-per-task", "--correction-replacement-bundle",
-            "--correction-replacement-sha256", "--replacement-control-run",
-        }
-        supplied = {value.split("=", 1)[0] for value in sys.argv[1:]}
         incompatible = sorted(collection_flags & supplied)
         if incompatible:
             parser.error("demonstration reuse excludes collection flags: "
@@ -385,6 +406,8 @@ def main():
         parser.error("canonical anchor coefficient must be nonnegative and finite")
     if args.checkpoint_every < 0:
         parser.error("checkpoint frequency must be nonnegative (0 disables)")
+    if args.validation_nll_episodes_per_task < 1:
+        parser.error("validation NLL episodes per task must be positive")
     if args.eval_every < 1 or args.feature_budget_mib < 1:
         parser.error("evaluation frequency and feature budget must be positive")
     if args.frame_budget_mib < 1:
@@ -401,6 +424,14 @@ def main():
                      "and a nonnegative prefix")
     if args.presentation_copies_per_episode < 0:
         parser.error("presentation copies must be nonnegative")
+    if augmentation_flags & supplied and not args.presentation_copies_per_episode:
+        parser.error("augmentation controls require positive --presentation-copies-per-episode")
+    for name in ("augmentation_themes", "augmentation_hud_layouts"):
+        selection = getattr(args, name)
+        if selection is not None and len(set(selection)) != len(selection):
+            parser.error(name.replace("_", " ") + " must be unique")
+    if not 4 <= args.augmentation_canvas_padding <= 64:
+        parser.error("augmentation canvas padding must be in 4..64")
     if not 0 <= args.memory_cue_pairs <= 64:
         parser.error("memory cue pairs must be in [0,64]")
     if (not 0 <= args.native_episodes_per_task <= 64
@@ -420,6 +451,8 @@ def main():
                        else args.level_bank_seed)
     config = replace(
         source_config, device="cpu", training_backend=args.training_backend,
+        screen_text_language=(args.screen_text_language if args.screen_text_language is not None
+                              else source_config.screen_text_language),
         learning_rate=args.learning_rate,
         curriculum_difficulty=(args.difficulty[0] if args.evaluation_difficulty is None
                                else args.evaluation_difficulty),
@@ -428,11 +461,19 @@ def main():
         level_bank_seed=level_bank_seed,
         curriculum_warmup_rollouts=0, eval_all_levels=False,
     )
-    corpus_reuse = None
+    corpus_reuse = appearance_reuse = None
     if args.demonstration_reuse_run is not None:
         # Validate before allocating a model or creating the optimizer continuation run.
         corpus_reuse = SavedDemonstrationReuse.prepare(
             args.demonstration_reuse_run, config=config, max_frame_bytes=frame_budget)
+    elif args.appearance_bundle is not None:
+        from carryrl.training.appearance import PreparedAppearanceReuse
+
+        appearance_reuse = PreparedAppearanceReuse.prepare(
+            args.appearance_bundle, expected_sha256=args.appearance_bundle_sha256,
+            arm=args.appearance_arm, config=config, max_frame_bytes=frame_budget)
+        corpus_reuse = appearance_reuse
+    if corpus_reuse is not None:
         recorded_difficulty = corpus_reuse.summary["source_difficulty"]
         config = replace(config,
             curriculum_difficulty=recorded_difficulty["curriculum_difficulty"],
@@ -441,6 +482,18 @@ def main():
         if args.feature_reuse_run is not None and (
                 args.feature_reuse_run.resolve() != corpus_reuse.directory):
             parser.error("exact demonstration and feature reuse must refer to the same source run")
+    diversity_pairs = None
+    if diversity_pairs_count:
+        required_task = {"navigation_geometry": "navigation", "reaction_dynamics": "reaction"}[
+            diversity_axis]
+        if required_task not in config.tasks or config.env_image_size != 96:
+            parser.error(f"{diversity_axis} requires {required_task} and canonical 96 RGB")
+        if corpus_reuse is not None:
+            from carryrl.training.runtime_diversity import collect_runtime_diversity_pairs
+
+            diversity_pairs = collect_runtime_diversity_pairs(diversity_axis, corpus_reuse.dataset,
+                max_pairs=diversity_pairs_count, seed=args.dataset_seed,
+                max_steps=config.max_episode_steps, max_frame_bytes=frame_budget, config=config)
     output = args.output
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -460,7 +513,14 @@ def main():
         np.random.seed(config.seed)
         agent, optimizer, reward, saved = load_sequence_checkpoint(
             args.warm_start, config, evaluation_only=True,
+            allow_reward_composition_change=args.allow_reward_composition_change,
         )
+        checkpoint_config = SequenceRunConfig.from_dict(saved["config"])
+        source_composition = _reward_composition_identity(checkpoint_config)
+        target_composition = _reward_composition_identity(config)
+        if args.allow_reward_composition_change and source_composition == target_composition:
+            raise ValueError("--allow-reward-composition-change requires an actual "
+                             "objective change")
         for group in optimizer.param_groups:
             group["lr"] = config.learning_rate
             group["weight_decay"] = config.weight_decay
@@ -495,10 +555,16 @@ def main():
             "source_checkpoint_sha256": source_manifest["sha256"],
             "initial_agent_sha256": tensor_hash(agent), "reward_sha256": reward_hash,
             "optimizer_state_preserved": True, "human_demonstrations": False,
+            "reward_composition_transfer": {
+                "source": source_composition, "target": target_composition,
+                "changed": source_composition != target_composition,
+                "explicitly_allowed": args.allow_reward_composition_change,
+            },
             "teacher": "scripted RGB controller; expert labels are not learned-agent results",
             "collection": "train-only; successful teacher trajectories and optional "
                           "learner-visited correction trajectories with actual action history",
             "evaluation": "frozen policy on validation levels; test remains unused",
+            "eval_all_levels": eval_all_levels,
             "wall_budget_scope": "training loop including scheduled validation; excludes "
                                  "preparation, initial and final full-bank evaluation",
             "counter_scope": "checkpoint rollout=0; agent decisions inherited; imitation "
@@ -507,15 +573,26 @@ def main():
         metadata["settings"] = {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
+            if key != "canonical_anchor_exclude_corrections" or value
         }
         metadata["canonical_anchor"] = {
             "coefficient": args.canonical_anchor_coefficient,
+            "exclude_corrections": canonical_anchor_exclude_corrections,
             "parent_checkpoint": str(args.warm_start.resolve()),
             "parent_checkpoint_sha256": source_manifest["sha256"],
             "parent_agent_sha256": metadata["initial_agent_sha256"],
-            "objective": "teacher-prefix conditional KL(parent||student); separately mean "
-                         "eligible canonical unstyled 96 episodes and physical decisions",
+            "objective": (
+                "teacher-prefix conditional KL(parent||student); mean physical decisions, "
+                "sum eligible non-correction canonical episodes / pre-mask canonical episodes"
+                if canonical_anchor_exclude_corrections else
+                "teacher-prefix conditional KL(parent||student); separately mean "
+                "eligible canonical unstyled 96 episodes and physical decisions"),
         }
+        if appearance_reuse is not None:
+            metadata["appearance_bundle"] = {
+                "source": str(appearance_reuse.directory),
+                "bundle_sha256": args.appearance_bundle_sha256, "arm": args.appearance_arm,
+            }
         if replacement_summary is not None:
             metadata["correction_replacement"] = {
                 **replacement_summary, "mode": "replace selected correction slots",
@@ -533,6 +610,8 @@ def main():
             dataset = corpus_reuse.dataset
             metadata["demonstration_reuse"] = corpus_reuse.summary
             metadata["collection"] = (
+                "prepared paired train appearance corpus; collection skipped"
+                if appearance_reuse is not None else
                 "exact complete saved train-only RGB/action corpus; collection skipped")
             progress.phase("collecting", total=len(dataset.episodes), unit="episodes")
             progress.update(force=True, phase_units_done=len(dataset.episodes),
@@ -625,7 +704,10 @@ def main():
                 copies = augment_demonstrations(
                     dataset, seed=args.dataset_seed,
                     copies_per_episode=args.presentation_copies_per_episode,
-                    max_frame_bytes=frame_budget)
+                    max_frame_bytes=frame_budget,
+                    themes=args.augmentation_themes, hud_layouts=args.augmentation_hud_layouts,
+                    textures=args.augmentation_textures,
+                    canvas_padding=args.augmentation_canvas_padding)
                 dataset.extend(copies)
                 del copies
                 progress.update(force=True, phase_units_done=len(dataset.episodes),
@@ -646,6 +728,36 @@ def main():
                     raise
                 atomic_json(output / "replacement_import_audit.json", import_audit)
                 metadata["correction_replacement"]["import_audit"] = import_audit
+        if diversity_pairs_count:
+            from carryrl.training.runtime_diversity import collect_runtime_diversity_pairs
+
+            if diversity_pairs is None:
+                diversity_pairs = collect_runtime_diversity_pairs(diversity_axis, dataset,
+                    max_pairs=diversity_pairs_count, seed=args.dataset_seed,
+                    max_steps=config.max_episode_steps, max_frame_bytes=frame_budget, config=config)
+            dataset.extend(diversity_pairs.arm(diversity_arm))
+            delta_metadata = {
+                **diversity_pairs.manifest,
+                "operation": "append delta to exact unchanged base",
+                "replay_weight_per_delta_episode": args.canonical_replay_weight,
+            }
+            if legacy_geometry:
+                metadata["navigation_geometry"] = {
+                    **delta_metadata, "mode": args.navigation_geometry_mode}
+            else:
+                metadata["runtime_diversity"] = {
+                    **delta_metadata, "axis": diversity_axis, "arm": diversity_arm}
+            metadata["collection"] = (
+                "unchanged base plus controlled navigation geometry delta" if legacy_geometry
+                else f"unchanged base plus controlled {diversity_axis} delta")
+            if corpus_reuse is not None:
+                corpus_reuse.assert_unchanged()
+                metadata["demonstration_reuse"] = {**corpus_reuse.summary,
+                    "collection_skipped": False, "source_corpus_preserved": True,
+                    "storage": "new combined compressed RGB archive; original feature references",
+                    "appended_episodes": diversity_pairs_count}
+            progress.update(force=True, demonstration_episodes=len(dataset.episodes),
+                            collection_skipped=False)
         if args.styled_correction_episodes_per_task:
             base_episodes = len(dataset.episodes)
             progress.phase("collecting", total=base_episodes + len(config.tasks)
@@ -692,14 +804,30 @@ def main():
                     "appended_episodes": len(dataset.episodes) - base_episodes}
             progress.update(force=True, phase_units_done=len(dataset.episodes),
                 demonstration_episodes=len(dataset.episodes), collection_skipped=False)
+        validate_dataset_runtime_holdout(dataset, level_bank_seed=config.level_bank_seed,
+            evaluation_difficulty=sequence_evaluation_protocol(config)["difficulty"])
         metadata["replay_weighting"] = imitation_replay_summary(
             dataset, canonical_replay_weight=args.canonical_replay_weight)
+        screen_text_provider = None
+        if config.screen_text_language is not None:
+            screen_text_provider = ImitationScreenText(
+                dataset, agent.screen_text_reader, output / "screen_text_observations.jsonl")
+            metadata["screen_text"] = {
+                "language": config.screen_text_language,
+                "artifact": screen_text_provider.path.name,
+                "sha256": file_sha256(screen_text_provider.path),
+                "observations": len(screen_text_provider.offsets),
+                "source": "actual saved RGB at each decision; untrusted OCR text",
+                "feature_storage": "frozen E5 tokens computed per minibatch; no corpus token cache",
+            }
         atomic_json(output / "metadata.json", metadata)
-        if corpus_reuse is not None and not args.styled_correction_episodes_per_task:
+        if (args.demonstration_reuse_run is not None
+                and not args.styled_correction_episodes_per_task
+                and not diversity_pairs_count):
             corpus_reuse.link_corpus(output)
         else:
             atomic_json(output / "demonstrations.json", dataset.provenance())
-            if args.styled_correction_episodes_per_task:
+            if args.styled_correction_episodes_per_task or diversity_pairs_count:
                 _publish_combined_frames(output, dataset.frames)
             elif len({frame.shape for frame in dataset.frames}) == 1:
                 np.savez_compressed(output / "demonstration_frames.npz",
@@ -861,12 +989,60 @@ def main():
 
             writer = SummaryWriter(str(args.tensorboard / output.name))
 
+        def validation_likelihood(epoch):
+            if not args.validation_nll:
+                return
+            from carryrl.evaluation.imitation import evaluate_imitation_validation
+
+            progress.phase("evaluation", unit="episodes", evaluation_episodes_completed=0)
+            nll_config = replace(config, eval_all_levels=False,
+                                 eval_episodes_per_task=args.validation_nll_episodes_per_task)
+
+            def likelihood_progress(event):
+                progress.update(phase_units_done=event["episodes_completed"],
+                                phase_units_total=event["episodes_total"],
+                                evaluation_episodes_completed=event["episodes_completed"],
+                                evaluation_episodes_total=event["episodes_total"],
+                                evaluation_policy=event["policy"], evaluation_task=event["task"],
+                                evaluation_step=event["step"],
+                                force=event["event"] == "episode_completed")
+
+            likelihood = evaluate_imitation_validation(
+                agent, nll_config, reward=reward,
+                on_progress=likelihood_progress,
+                checkpoint_weights_revision=saved["weights_revision"] + status["optimizer_steps"])
+            likelihood["epoch"] = epoch
+            atomic_json(output / "validation_likelihood" / f"epoch_{epoch:04d}.json", likelihood)
+
+        last_full_evaluation = None
+
         def evaluate(epoch, *, all_levels=False, phase="evaluation"):
+            nonlocal last_full_evaluation
             progress.phase(phase, unit="episodes", evaluation_episodes_completed=0)
             revision = saved["weights_revision"] + status["optimizer_steps"]
             agent_hash = tensor_hash(agent)
+            reward_evaluation_hash = tensor_hash(reward)
             suffix = "_final" if phase == "final_evaluation" else ""
             evaluation_path = output / "evaluations" / f"epoch_{epoch:04d}{suffix}.json"
+            evaluation_config = replace(config, eval_all_levels=all_levels)
+            if eval_all_levels and all_levels:
+                protocol = sequence_evaluation_protocol(evaluation_config)
+                protocol_hash = hashlib.sha256(
+                    json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+                identity = (epoch, revision, agent_hash, reward_evaluation_hash, protocol_hash)
+                if (phase == "final_evaluation" and last_full_evaluation is not None
+                        and last_full_evaluation[0] == identity):
+                    _, source_path, measured = last_full_evaluation
+                    atomic_json(evaluation_path, {**measured, "final_evaluation_reuse": {
+                        "source": str(source_path.resolve()),
+                        "source_sha256": file_sha256(source_path),
+                        "measurement_reused": True,
+                    }})
+                    count = len(measured["records"])
+                    progress.update(force=True, phase_units_done=count, phase_units_total=count,
+                                    evaluation_episodes_completed=count,
+                                    evaluation_episodes_total=count)
+                    return
 
             def evaluation_progress(event):
                 progress.update(phase_units_done=event["episodes_completed"],
@@ -888,11 +1064,10 @@ def main():
                                           agent_sha256=agent_hash, weights_revision=revision,
                                           evaluation_reference=evaluation_path)
 
-            evaluated = evaluate_sequence(agent, reward,
-                                          replace(config, eval_all_levels=all_levels),
+            evaluated = evaluate_sequence(agent, reward, evaluation_config,
                                           on_progress=evaluation_progress, on_playback=playback)
             evaluated.update(epoch=epoch, weights_revision=revision, agent_sha256=agent_hash,
-                             reward_sha256=tensor_hash(reward))
+                             reward_sha256=reward_evaluation_hash)
             atomic_json(evaluation_path, evaluated)
             summary = evaluated["summaries"]["frozen_deterministic"]
             print(f"epoch {epoch}: greedy wins {summary['outcomes']['success']}/"
@@ -903,9 +1078,15 @@ def main():
                         writer.add_scalar(f"imitation_eval/{policy}/{task}/success_rate",
                                           values["success_rate_lower"], epoch)
                 writer.flush()
+            validation_likelihood(epoch)
+            if (eval_all_levels and all_levels and phase == "evaluation"
+                    and evaluated.get("policy_and_reward_frozen") is True
+                    and evaluated.get("protocol_sha256") == protocol_hash):
+                last_full_evaluation = (identity, evaluation_path, evaluated)
         if reused_initial is None:
             evaluate(0, all_levels=args.final_all_levels, phase="initial_evaluation")
         else:
+            validation_likelihood(0)
             print("epoch 0: reused validated frozen measurement from "
                   f"{args.reuse_initial_evaluation}", flush=True)
         progress.phase("imitation", total=args.epochs * batches_per_epoch,
@@ -961,7 +1142,7 @@ def main():
                                           row["epoch"])
                 writer.flush()
             if row["complete"] and row["epoch"] % args.eval_every == 0:
-                evaluate(row["epoch"])
+                evaluate(row["epoch"], all_levels=eval_all_levels)
                 progress.phase("imitation", total=args.epochs * batches_per_epoch,
                                done=status["optimizer_steps"], unit="optimizer_steps")
             _save_epoch_snapshot(
@@ -993,9 +1174,12 @@ def main():
             agent, dataset, epochs=args.epochs, backend=args.training_backend,
             optimizer=optimizer, mlx_backend=engine, learning_rate=config.learning_rate,
             weight_decay=config.weight_decay, minibatch_episodes=args.minibatch_episodes,
+            max_grad_norm=config.max_grad_norm,
             action_balance=args.action_balance,
             canonical_replay_weight=args.canonical_replay_weight,
             canonical_anchor_coefficient=args.canonical_anchor_coefficient,
+            canonical_anchor_exclude_corrections=canonical_anchor_exclude_corrections,
+            screen_text_provider=screen_text_provider,
             seed=args.dataset_seed, feature_provider=feature_provider,
             on_epoch=epoch_done, on_update=update_done, on_epoch_start=epoch_started,
             max_wall_seconds=args.max_wall_seconds,
@@ -1029,6 +1213,12 @@ def main():
         progress.phase("finished", status="completed", checkpoint=str(checkpoint),
                        stop_reason=result["stop_reason"],
                        training_budget_seconds=training_budget_seconds)
+        from carryrl.training.storage_maintenance import maybe_launch
+
+        storage_root = next((parent.parent for parent in output.resolve().parents
+                             if parent.name == "runs"), None)
+        if storage_root is not None:
+            maybe_launch(storage_root)
     except BaseException as error:
         recovery_save = None
         if agent is not None and status["optimizer_steps"]:

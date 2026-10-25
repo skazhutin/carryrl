@@ -277,11 +277,15 @@ def test_local_resource_roundtrip_requires_strict_weight_restoration(tmp_path, m
     assert calls == [{"local_files_only": True, "trust_remote_code": False}]
     with pytest.raises(RuntimeError, match="strict checkpoint"):
         restored("Двигайся влево")
+    with pytest.raises(RuntimeError, match="strict checkpoint"):
+        restored.encode_tokens("видимый текст")
     incomplete = original.state_dict().copy()
     incomplete.pop(next(iter(incomplete)))
     restored.load_state_dict(incomplete, strict=False)
     with pytest.raises(RuntimeError, match="strict checkpoint"):
         restored("Двигайся влево")
+    with pytest.raises(RuntimeError, match="strict checkpoint"):
+        restored.encode_tokens("видимый текст")
     restored.load_state_dict(original.state_dict(), strict=True)
     torch.testing.assert_close(restored("Двигайся влево"), original("Двигайся влево"),
                                atol=0, rtol=0)

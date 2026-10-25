@@ -37,3 +37,5 @@ def test_perfect_score_requires_visible_success_and_known_outcome():
     assert result['perfect_score_successes'] == 1
     assert result['perfect_score_rate'] == .25
     assert result['tasks']['navigation']['perfect_score_successes'] == 1
+    assert 'quality' not in result
+    assert 'quality' not in result['tasks']['navigation']

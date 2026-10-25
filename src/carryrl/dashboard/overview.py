@@ -1,4 +1,4 @@
-"""Serve the local, read-only training overview on loopback."""
+"""Serve the local training overview and explicitly requested frozen replays."""
 
 from __future__ import annotations
 
@@ -9,18 +9,24 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from carryrl.dashboard.overview_data import NAME, OverviewReader
+from carryrl.dashboard.validation_browser import ReplayBusy, ReplayResources, ValidationBrowser
 
 ASSETS = Path(__file__).with_name('assets')
 
 
-def make_server(reader, host='127.0.0.1', port=6009, *, assets=ASSETS):
+def make_server(reader, host='127.0.0.1', port=6009, *, assets=ASSETS, validation=None):
     if host not in {'127.0.0.1', 'localhost'}:
         raise ValueError('The overview server binds only to 127.0.0.1 or localhost')
     if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
         raise ValueError('Invalid overview port')
     assets = Path(assets)
+    validation = validation or ValidationBrowser(getattr(reader, 'root', Path('runs')))
 
     class Handler(BaseHTTPRequestHandler):
+        def _json(self, value, status=200):
+            self._respond(json.dumps(value, ensure_ascii=False, allow_nan=False).encode(),
+                          'application/json; charset=utf-8', status)
+
         def _respond(self, content, content_type, status=200):
             self.send_response(status)
             self.send_header('Content-Type', content_type)
@@ -40,6 +46,41 @@ def make_server(reader, host='127.0.0.1', port=6009, *, assets=ASSETS):
                 self._respond(json.dumps(message, ensure_ascii=False).encode(),
                               'application/json; charset=utf-8', 500)
 
+        def do_POST(self):
+            expected_hosts = {f'127.0.0.1:{self.server.server_port}',
+                              f'localhost:{self.server.server_port}'}
+            host_header = self.headers.get('Host', '').lower()
+            origin = self.headers.get('Origin')
+            if (host_header not in expected_hosts
+                    or (origin is not None and origin != f'http://{host_header}')
+                    or self.headers.get('Sec-Fetch-Site') == 'cross-site'):
+                self._json({'error': 'Forbidden origin or host'}, 403)
+                return
+            if urlsplit(self.path).path != '/api/replay':
+                self._json({'error': 'Unsupported method'}, 501)
+                return
+            if (self.headers.get_content_type() != 'application/json'
+                    or self.headers.get('Transfer-Encoding') is not None):
+                self._json({'error': 'Требуется application/json с Content-Length'}, 400)
+                return
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 1 <= length <= 4096:
+                    raise ValueError('Размер запроса должен быть 1..4096 байт')
+                self.connection.settimeout(5)
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise ValueError('Неполный запрос')
+                self._json(validation.start(json.loads(raw)), 202)
+            except ReplayBusy as error:
+                self._json({'error': str(error)}, 409)
+            except ReplayResources as error:
+                self._json({'error': str(error)}, 503)
+            except (ValueError, TypeError, OSError) as error:
+                self._json({'error': str(error)[:500]}, 400)
+            except Exception as error:
+                self._json({'error': f'Не удалось запустить повтор: {error}'}, 500)
+
         def _get(self):
             host_header = self.headers.get('Host', '').split(':', 1)[0].lower()
             if host_header not in {'127.0.0.1', 'localhost'}:
@@ -47,6 +88,28 @@ def make_server(reader, host='127.0.0.1', port=6009, *, assets=ASSETS):
                 return
             route = urlsplit(self.path)
             path = unquote(route.path)
+            if path == '/api/validation':
+                try:
+                    self._json(validation.catalog(parse_qs(route.query).get('run', [''])[0]))
+                except (ValueError, OSError) as error:
+                    self._json({'error': str(error)[:500]}, 400)
+                return
+            if path == '/api/replay':
+                data = validation.status(parse_qs(route.query).get('id', [''])[0])
+                self._json(data or {'error': 'Неизвестный повтор'}, 200 if data else 404)
+                return
+            if path.startswith('/replay-media/'):
+                parts = path.split('/')
+                try:
+                    content = validation.media(*parts[2:]) if len(parts) == 5 else None
+                except (ValueError, OSError):
+                    content = None
+                if content is not None:
+                    self._respond(content, 'image/png' if parts[-1].endswith('.png')
+                                  else 'image/gif')
+                else:
+                    self._json({'error': 'Not found'}, 404)
+                return
             if path == '/api/overview':
                 query = parse_qs(route.query)
                 if 'run' in query:
@@ -112,6 +175,9 @@ def main():
     except (OSError, ValueError) as error:
         parser.exit(2, f'Cannot start overview: {error}\n')
     print(f'Training overview: http://127.0.0.1:{server.server_port}', flush=True)
+    from carryrl.training.storage_maintenance import maybe_launch
+
+    maybe_launch(args.runs.resolve().parent)
     try:
         server.serve_forever(poll_interval=.5)
     except KeyboardInterrupt:

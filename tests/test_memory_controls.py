@@ -225,8 +225,11 @@ def test_cli_test_split_propagates_without_evaluating_policy(tmp_path, monkeypat
                                     "--config", "unused", "--output", str(output),
                                     "--split", "test"])
     monkeypatch.setattr(diagnostic.SequenceRunConfig, "load", lambda _: config())
-    monkeypatch.setattr(diagnostic, "load_sequence_checkpoint", lambda *args, **kwargs:
-                        (None, None, None, {"weights_revision": 3}))
+    def frozen_load(*args, **kwargs):
+        assert kwargs["evaluation_only"] is True and kwargs["load_optimizer"] is False
+        return None, None, None, {"weights_revision": 3}
+
+    monkeypatch.setattr(diagnostic, "load_sequence_checkpoint", frozen_load)
     captured = []
     def fixture_report(agent, reward, cfg, **kwargs):
         captured.append(kwargs)

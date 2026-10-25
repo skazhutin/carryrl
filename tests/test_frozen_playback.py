@@ -1,5 +1,8 @@
+import gzip
 import hashlib
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,6 +10,65 @@ from PIL import Image
 
 from carryrl.dashboard.frozen_playback import MAX_FRAMES, write_frozen_playback
 from carryrl.envs.atomic import AtomicEnv, verify_visible_outcome
+
+
+@pytest.mark.parametrize("archived", [False, True])
+def test_frozen_loader_restores_ocr_reader_without_new_policy_parameters(
+        tmp_path, monkeypatch, archived):
+    from test_agent_instructions import TinyBackbone, TinyTokenizer
+    from test_sequence_training import TinyReward, TinyVision, config
+
+    from carryrl.agent.language import MultilingualInstructionEncoder
+    from carryrl.agent.model import GeneralistAgent
+    from carryrl.dashboard import frozen_playback
+    from carryrl.training.sequence import save_sequence_checkpoint, tensor_hash
+
+    class LocalLanguage(MultilingualInstructionEncoder):
+        def __init__(self):
+            super().__init__(tokenizer=TinyTokenizer(), backbone=TinyBackbone())
+
+        def save_resources(self, directory):
+            directory.mkdir(parents=True)
+            for name in ("carryrl_language.json", "config.json", "tokenizer.json",
+                         "tokenizer_config.json"):
+                (directory / name).write_text("{}")
+
+    class EmptyOptimizer:
+        def state_dict(self):
+            return {}
+
+    cfg = config()
+    cfg = replace(cfg, agent=replace(cfg.agent, text_encoder="multilingual_e5_small"),
+                  screen_text_language="eng")
+    agent = GeneralistAgent(cfg.agent, vision=TinyVision(), language=LocalLanguage())
+    run = tmp_path / "runs" / "frozen"
+    run.mkdir(parents=True)
+    checkpoint = save_sequence_checkpoint(agent, EmptyOptimizer(), TinyReward(), cfg,
+        run, rollout=0, decisions=0, revision=1)
+    if archived:
+        state = checkpoint / "state.pt"
+        state.with_suffix(".pt.gz").write_bytes(gzip.compress(state.read_bytes()))
+        state.unlink()
+        monkeypatch.setattr("carryrl.training.checkpoint_storage.shutil.disk_usage",
+                            lambda path: SimpleNamespace(free=100 * 1024**3))
+    monkeypatch.setattr(MultilingualInstructionEncoder, "from_resources",
+                        lambda *args, **kwargs: LocalLanguage())
+    monkeypatch.setattr(frozen_playback, "GeneralistAgent", lambda model_config, language:
+        GeneralistAgent(model_config, vision=TinyVision(), language=language))
+    readers = []
+
+    def reader(**kwargs):
+        readers.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("carryrl.perception.screen_text.ScreenTextReader", reader)
+    restored, restored_cfg, _ = frozen_playback.load_frozen_agent(checkpoint)
+    assert readers == [{"language": "eng", "cache_entries": 128}]
+    assert restored.screen_text_reader is not None
+    assert restored_cfg.screen_text_language == "eng"
+    assert tensor_hash(restored) == tensor_hash(agent)
+    assert (checkpoint / "state.pt").is_file()
+    assert not (checkpoint / "state.pt.gz").exists()
 
 
 def episode():

@@ -233,7 +233,8 @@ def test_script_disk_cache_hit_skips_encoding_and_reports_original_cache_timesta
                 pytest.fail("cache-hit run must not invoke frozen vision")
             agent.vision.forward = forbid_encoding
         optimizer = torch.optim.AdamW(p for p in agent.parameters() if p.requires_grad)
-        return agent, optimizer, torch.nn.Linear(1, 1), {"weights_revision": 0, "decisions": 0}
+        return agent, optimizer, torch.nn.Linear(1, 1), {
+            "weights_revision": 0, "decisions": 0, "config": config.to_dict()}
 
     def save_checkpoint(agent, optimizer, reward, config, output, **kwargs):
         checkpoint = output / "checkpoints" / "rollout_0000"

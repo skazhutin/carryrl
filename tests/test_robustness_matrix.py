@@ -34,10 +34,11 @@ def install_stubs(monkeypatch, output, *, fail_at=None):
     calls, loads = [], []
     agent, reward = nn.Linear(1, 1), nn.Linear(1, 1)
 
-    def load(checkpoint, cfg, *, evaluation_only):
+    def load(checkpoint, cfg, *, evaluation_only, load_optimizer):
         assert evaluation_only is True
+        assert load_optimizer is False
         loads.append(cfg)
-        return agent, object(), reward, {"weights_revision": 3}
+        return agent, None, reward, {"weights_revision": 3}
 
     def evaluate(actor, evaluator_reward, cfg, *, split):
         assert actor is agent and evaluator_reward is reward

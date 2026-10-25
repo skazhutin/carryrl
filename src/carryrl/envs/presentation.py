@@ -11,6 +11,8 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from carryrl.envs.pixel_art import PIXEL_STYLE_SPLITS, style_pixel_art
+
 HUD_LAYOUTS = ("top", "bottom", "left", "right")
 HUD_THEMES = {
     "slate": {"background": (20, 27, 39), "text": (237, 243, 251), "font_size": 10},
@@ -37,6 +39,7 @@ class PresentationConfig:
     seed: int = 0
     canvas_padding: int = 8
     style_split: str | None = None
+    pixel_art: bool = False
 
     def __post_init__(self):
         for name in ("native_sizes", "themes", "hud_layouts"):
@@ -59,6 +62,8 @@ class PresentationConfig:
             raise ValueError("Canvas padding must be an integer in 4..64")
         if not isinstance(self.textures, bool):
             raise ValueError("textures must be a boolean")
+        if not isinstance(self.pixel_art, bool):
+            raise ValueError("pixel_art must be a boolean")
         if self.style_split is not None and self.style_split not in THEME_SPLITS:
             raise ValueError("Unknown appearance split")
 
@@ -106,14 +111,34 @@ class PresentationProfile:
     texture_seed: int = 0
     textures: bool = True
     canvas_padding: int = 8
+    pixel_art: bool = False
+    pixel_style: str | None = None
+    canonical_hud: bool = False
+    pixel_task: str | None = None
 
     def __post_init__(self):
         PresentationConfig(mode="varied", native_sizes=(self.native_size,), themes=(self.theme,),
                            hud_layouts=(self.hud_layout,), textures=self.textures,
-                           seed=self.texture_seed, canvas_padding=self.canvas_padding)
+                           seed=self.texture_seed, canvas_padding=self.canvas_padding,
+                           pixel_art=self.pixel_art)
+        if not isinstance(self.canonical_hud, bool):
+            raise ValueError("canonical_hud must be a boolean")
+        styles = {style for styles in PIXEL_STYLE_SPLITS.values() for style in styles}
+        if ((self.pixel_art and self.pixel_style not in styles)
+                or (not self.pixel_art and self.pixel_style is not None)):
+            raise ValueError("pixel_art requires a supported pixel_style")
+        if self.canonical_hud and not self.pixel_art:
+            raise ValueError("canonical_hud requires pixel_art")
+        if self.pixel_task is not None:
+            from carryrl.envs.atomic_suite import TASKS
+
+            if not self.pixel_art or self.pixel_task not in TASKS:
+                raise ValueError("pixel_task requires pixel_art and a supported task")
 
     @property
     def canvas_size(self) -> tuple[int, int]:
+        if self.canonical_hud:
+            return self.native_size, self.native_size
         panel_width, panel_height = hud_size(self.hud_layout)
         padding = self.canvas_padding
         if self.hud_layout in {"top", "bottom"}:
@@ -126,6 +151,8 @@ class PresentationProfile:
 
     @property
     def viewport_box(self) -> tuple[int, int, int, int]:
+        if self.canonical_hud:
+            return 0, 0, self.native_size, self.native_size
         width, height = self.canvas_size
         panel_width, panel_height = hud_size(self.hud_layout)
         padding, size = self.canvas_padding, self.native_size
@@ -139,6 +166,10 @@ class PresentationProfile:
 
     @property
     def hud_box(self) -> tuple[int, int, int, int]:
+        if self.canonical_hud:
+            from carryrl.rewards.visual import HUD_HEIGHT
+
+            return 0, 0, self.native_size, HUD_HEIGHT
         width, height = self.canvas_size
         panel_width, panel_height = hud_size(self.hud_layout)
         padding = self.canvas_padding
@@ -156,6 +187,8 @@ def choose_presentation(
     split: str,
     episode_seed: int,
     image_size: int = 96,
+    *,
+    task: str | None = None,
 ) -> PresentationProfile | None:
     """Choose appearance without consuming the level/mechanics RNG."""
     if config is None:
@@ -164,17 +197,25 @@ def choose_presentation(
         config = PresentationConfig(**config)
     if not isinstance(config, PresentationConfig):
         raise TypeError("Expected PresentationConfig, configuration dict, or None")
-    if config.mode == "canonical":
+    if config.mode == "canonical" and not config.pixel_art:
         return None
     appearance_split = config.style_split or split
     if appearance_split not in THEME_SPLITS:
         raise ValueError("Unknown appearance split")
-    themes = tuple(theme for theme in config.themes if theme in THEME_SPLITS[appearance_split])
-    if not themes:
-        raise ValueError("No configured themes belong to the requested appearance split")
     if isinstance(episode_seed, bool) or not isinstance(episode_seed, int) or episode_seed < 0:
         raise ValueError("Appearance episode seed must be a nonnegative integer")
     rng = np.random.default_rng(np.random.SeedSequence([config.seed, episode_seed]))
+    if config.mode == "canonical":
+        return PresentationProfile(
+            native_size=image_size, theme="slate", hud_layout="top",
+            texture_seed=int(rng.integers(2**31)), textures=config.textures,
+            pixel_art=True, pixel_style=str(rng.choice(PIXEL_STYLE_SPLITS[appearance_split])),
+            canonical_hud=True,
+            pixel_task=task,
+        )
+    themes = tuple(theme for theme in config.themes if theme in THEME_SPLITS[appearance_split])
+    if not themes:
+        raise ValueError("No configured themes belong to the requested appearance split")
     return PresentationProfile(
         native_size=int(rng.choice(config.native_sizes)),
         theme=str(rng.choice(themes)),
@@ -182,6 +223,10 @@ def choose_presentation(
         texture_seed=int(rng.integers(2**31)),
         textures=config.textures,
         canvas_padding=config.canvas_padding,
+        pixel_art=config.pixel_art,
+        pixel_style=(str(rng.choice(PIXEL_STYLE_SPLITS[appearance_split]))
+                     if config.pixel_art else None),
+        pixel_task=task if config.pixel_art else None,
     )
 
 
@@ -233,11 +278,18 @@ def present_frame(canonical_rgb: np.ndarray, profile: PresentationProfile) -> np
     if (not isinstance(canonical_rgb, np.ndarray) or canonical_rgb.dtype != np.uint8
             or canonical_rgb.shape != (profile.native_size, profile.native_size, 3)):
         raise ValueError("Expected canonical RGB at the profile's unscaled native size")
+    if profile.pixel_art:
+        viewport = style_pixel_art(canonical_rgb, profile.pixel_style,
+                                   profile.texture_seed, textures=profile.textures,
+                                   task=profile.pixel_task)
+        if profile.canonical_hud:
+            return viewport
+    else:
+        viewport = _style_viewport(canonical_rgb, profile)
     outcome = verify_visible_outcome(canonical_rgb)
     if not outcome["known"]:
         raise ValueError("Canonical HUD is unknown; refusing to infer presentation labels")
     status = "Success" if outcome["success"] else "Failed" if outcome["failure"] else "Play"
-    viewport = _style_viewport(canonical_rgb, profile)
     # The old score panel disappears completely; no duplicate outcome is left.
     viewport[:HUD_HEIGHT] = np.array((31, 38, 52), dtype=np.uint8)
     width, height = profile.canvas_size

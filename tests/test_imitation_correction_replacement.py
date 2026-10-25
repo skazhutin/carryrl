@@ -157,7 +157,8 @@ def test_content_digest_ignores_storage_indices_but_preserves_history_and_instru
     changed = replace(remapped, instruction="Different instruction")
     assert demonstration_episode_digest(imported, changed) != demonstration_episode_digest(
         imported, remapped)
-    changed = replace(remapped, executed_actions=(PhysicalAction(),) * len(remapped))
+    changed = replace(remapped, executed_actions=(PhysicalAction(),) * len(remapped),
+                      quality=None, quality_source=None)
     assert demonstration_episode_digest(imported, changed) != demonstration_episode_digest(
         imported, remapped)
 
@@ -286,7 +287,8 @@ def stub_script(monkeypatch, tmp_path):
     monkeypatch.setattr(script.SequenceRunConfig, "load", lambda _: config)
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
         (agent, SimpleNamespace(param_groups=[{}]), reward, {"decisions": 0,
-                                                           "weights_revision": 13053}))
+                                                           "weights_revision": 13053,
+                                                           "config": config.to_dict()}))
     monkeypatch.setattr(script, "tensor_hash", lambda value:
         REWARD_HASH if value is reward else ACTOR_HASH)
     monkeypatch.setattr(script, "provenance", lambda: {})
@@ -481,7 +483,7 @@ def test_trainer_reuse_encodes_only_missing_and_keeps_progress_compact(
                         REWARD_HASH if value is reward else ACTOR_HASH)
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
                         (agent, SimpleNamespace(param_groups=[{}]), reward,
-                         {"decisions": 0, "weights_revision": 13053}))
+                         {"decisions": 0, "weights_revision": 13053, "config": config.to_dict()}))
     monkeypatch.setattr(script, "collect_scripted_demonstrations", lambda *a, **k: dataset)
 
     def stop_before_evaluation(*args, **kwargs):

@@ -119,7 +119,8 @@ def test_main_publishes_verified_baseline_before_collection_and_encoding(
     monkeypatch.setattr(script.SequenceRunConfig, "load", lambda _: arguments["config"])
     monkeypatch.setattr(script, "provenance", lambda: {})
     monkeypatch.setattr(script, "load_sequence_checkpoint", lambda *a, **k:
-        (agent, optimizer, reward, {"decisions": 0, "weights_revision": 3}))
+        (agent, optimizer, reward, {"decisions": 0, "weights_revision": 3,
+                                   "config": arguments["config"].to_dict()}))
     monkeypatch.setattr(script, "evaluate_sequence", lambda *a, **k:
         pytest.fail("publishing an existing measurement must not evaluate again"))
     observed = []
@@ -149,6 +150,8 @@ def test_main_publishes_verified_baseline_before_collection_and_encoding(
         raise RuntimeError("stop after encoding observation")
 
     monkeypatch.setattr(script, "collect_scripted_demonstrations", collect)
+    # This test isolates publication order with a lifecycle-only dataset stub.
+    monkeypatch.setattr(script, "validate_dataset_runtime_holdout", lambda *a, **k: None)
     agent.encode_frames = encode
     monkeypatch.setattr(sys, "argv", ["train_imitation.py", "--config", "unused.json",
         "--warm-start", str(arguments["checkpoint"]), "--output", str(output),

@@ -1,6 +1,7 @@
 """Offline integration checks for history replay, PPO weighting, and atomic continuation."""
 
 import json
+import weakref
 from dataclasses import replace
 from pathlib import Path
 
@@ -107,6 +108,10 @@ def test_frozen_evaluation_callbacks_actual_final_rgb_and_progress_preserve_poli
         assert record["policy"] == "frozen_deterministic" and record["episode_index"] == 0
         assert len(frames) == len(actions) + 1 == record["steps"] + 1
         assert verify_visible_outcome(frames[-1]) == record["outcome"]
+        quality = record["quality"]
+        assert quality["commands"] == record["steps"]
+        assert quality["active_commands"] + quality["neutral_commands"] == record["steps"]
+        assert quality["game_seconds"] == pytest.approx(record["steps"] * 0.1)
         assert all({"keys", "mouse_buttons", "dx", "dy", "wheel"} <= set(action)
                    for action in actions)
         # Captured post-action observations are independent copies, including terminal RGB.
@@ -114,6 +119,8 @@ def test_frozen_evaluation_callbacks_actual_final_rgb_and_progress_preserve_poli
                    for left, right in zip(frames, frames[1:]))
     assert tensor_hash(agent) == before and agent.training
     assert evaluated["elapsed_seconds"] >= 0 and len(evaluated["protocol_sha256"]) == 64
+    assert set(evaluated["quality_contracts"]) == set(cfg.tasks)
+    assert evaluated["summaries"]["frozen_deterministic"]["quality"]["episodes_measured"] == 2
 
 
 def test_gae_terminal_and_truncation_final_history_bootstrap():
@@ -240,6 +247,8 @@ def test_atomic_checkpoint_resume_optimizer_frozen_evaluation_and_no_overwrite(t
     assert second["attempted_train_decisions_this_process"] == 8
     metadata = json.loads((tmp_path / "second/metadata.json").read_text())
     assert metadata["resume_rng_restored"] is False
+    assert metadata["bootstrap_is_supervised"] is False
+    assert metadata["reward_bootstrap_executed"] is False
     records = list((tmp_path / "first/trajectories/rollout_0001").glob("*.npz"))
     with np.load(records[0], allow_pickle=False) as record:
         assert record["frames"].dtype == np.uint8 and len(record["old_log_prob"]) == 4
@@ -775,6 +784,9 @@ def test_warm_start_preserves_parent_tensors_moments_and_cumulative_counters(tmp
     assert baseline["weights_revision"] == parent["weights_revision"]
     assert baseline["evaluation_difficulty"] == .15
     metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["bootstrap_is_supervised"] is False
+    assert metadata["reward_bootstrap_executed"] is False
+    assert not (output / "reward_bootstrap.json").exists()
     lineage = metadata["warm_start_parent"]
     assert metadata["resume"] is None and metadata["warm_start_rng_restored"] is False
     assert SequenceRunConfig.from_dict(lineage["source_config"]) == cfg
@@ -1167,3 +1179,366 @@ def test_evaluate_cli_difficulty_overrides_configured_evaluation_difficulty(tmp_
     assert observed[0].evaluation_difficulty == .25
     assert observed[0].curriculum_difficulty == .25
     assert json.loads((output / "evaluation.json").read_text())["evaluation_difficulty"] == .25
+
+
+@pytest.mark.parametrize("all_levels", [False, True])
+def test_canonical_evaluation_matches_historic_protocol_and_preserves_training_styles(all_levels):
+    from carryrl.envs.presentation import PresentationConfig
+    from carryrl.training.sequence import sequence_evaluation_protocol
+
+    torch.set_num_threads(1)
+    historical = replace(config(), tasks=("navigation",), eval_all_levels=all_levels)
+    styled = replace(historical, evaluation_canonical=True,
+                     visual_config=PresentationConfig(mode="varied", pixel_art=True))
+    calls = []
+
+    def recorded_factory(task, **kwargs):
+        calls.append(kwargs)
+        return AtomicEnv(task, **kwargs)
+
+    agent, reward = factory(styled.agent), TinyReward().eval().requires_grad_(False)
+    collect_episode(agent, reward, styled, task="navigation", seed=0,
+                    env_factory=recorded_factory)
+    assert calls and all(row["visual_config"] == styled.visual_config for row in calls)
+    calls.clear()
+    actual = evaluate_sequence(agent, reward, styled, env_factory=recorded_factory)
+    assert calls and all("visual_config" not in row for row in calls)
+    assert sequence_evaluation_protocol(styled) == sequence_evaluation_protocol(historical)
+    expected = evaluate_sequence(agent, reward, historical)
+    assert actual["protocol_sha256"] == expected["protocol_sha256"]
+    assert actual["summaries"] == expected["summaries"]
+    assert styled.visual_config.pixel_art is True
+    default_styled = replace(styled, evaluation_canonical=False)
+    assert sequence_evaluation_protocol(default_styled)["visual_config"]["pixel_art"] is True
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_reward_bootstrap_metadata_describes_work_executed_in_current_process(
+        tmp_path, monkeypatch, fresh):
+    import carryrl.training.sequence as sequence
+
+    calls = []
+
+    def prepare(*args):
+        calls.append(True)
+        return TinyReward()
+
+    monkeypatch.setattr(sequence, "prepare_reward", prepare)
+    output = tmp_path / "fresh"
+    train_sequence(config(), output, agent_factory=factory,
+                   reward=None if fresh else TinyReward(), reward_factory=TinyReward)
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert bool(calls) is fresh
+    assert metadata["reward_bootstrap_executed"] is fresh
+    assert metadata["bootstrap_is_supervised"] is fresh
+
+
+@pytest.mark.parametrize("field,value", [
+    ("checkpoint_keep_raw", 1), ("checkpoint_keep_raw", -1),
+    ("checkpoint_keep_raw", True), ("evaluation_canonical", 1),
+])
+def test_sequence_retention_and_canonical_settings_are_strict(field, value):
+    with pytest.raises(ValueError, match=field):
+        replace(config(), **{field: value})
+
+
+def test_training_retention_runs_after_atomic_save_and_preserves_trajectories(
+        tmp_path, monkeypatch):
+    import carryrl.training.ppo_checkpoint_retention as retention
+
+    original = retention.retain_completed_checkpoints
+    observations = []
+
+    def retain(output, owned, **kwargs):
+        latest = Path(json.loads((output / "latest.json").read_text())["checkpoint"])
+        assert latest == owned[-1] and (latest / "state.pt").is_file()
+        observations.append(latest)
+        return original(output, owned, **{**kwargs, "min_free_bytes": 0})
+
+    monkeypatch.setattr(retention, "retain_completed_checkpoints", retain)
+    cfg = replace(config(), total_rollouts=4, checkpoint_keep_raw=2)
+    output = tmp_path / "runs" / "stage"
+    summary = train_sequence(cfg, output, agent_factory=factory,
+                             reward=TinyReward(), reward_factory=TinyReward)
+    assert summary["status"] == "completed" and len(observations) == 4
+    checkpoints = sorted((output / "checkpoints").glob("rollout_*"))
+    assert [path.name for path in checkpoints if (path / "state.pt").is_file()] == [
+        "rollout_0000", "rollout_0003", "rollout_0004"]
+    assert len(list((output / "trajectories").rglob("*.npz"))) == 8
+    latest = Path(summary["latest_checkpoint"])
+    _, _, _, saved = load_sequence_checkpoint(
+        latest, replace(cfg, total_rollouts=5), agent_factory=factory, reward_factory=TinyReward)
+    assert saved["rollout"] == 4
+
+
+@pytest.mark.parametrize("changes", [
+    {"evaluation_canonical": False}, {"visual_config": None},
+    {"visual_config": {"pixel_art": False}},
+    {"visual_config": {"pixel_art": True, "style_split": "train"}},
+    {"evaluation_pixel_art": 1},
+])
+def test_pixel_evaluation_requires_canonical_baseline_and_automatic_pixel_style_split(changes):
+    from carryrl.envs.presentation import PresentationConfig
+
+    cfg = replace(config(), evaluation_canonical=True, evaluation_pixel_art=True,
+                  visual_config=PresentationConfig(pixel_art=True))
+    with pytest.raises(ValueError, match="evaluation_pixel_art"):
+        replace(cfg, **changes)
+
+
+def test_training_saves_both_frozen_styles_at_initial_scheduled_and_final_evaluations(
+        tmp_path, monkeypatch):
+    import carryrl.dashboard.frozen_playback as frozen_playback
+    import carryrl.training.sequence as sequence
+    from carryrl.envs.pixel_art import PIXEL_STYLE_SPLITS
+    from carryrl.envs.presentation import PresentationConfig
+
+    cfg = replace(config(), total_rollouts=3, eval_every_rollouts=2,
+                  checkpoint_every_rollouts=3, evaluate_initial=True,
+                  evaluation_canonical=True, evaluation_pixel_art=True,
+                  visual_config=PresentationConfig(pixel_art=True))
+    original_evaluate = sequence.evaluate_sequence
+    original_write = sequence.atomic_json
+    reports, phases, styles, factories = [], [], [], []
+    playback_calls = []
+    original_playback = frozen_playback.write_frozen_playback
+
+    def playback(run, record, frames, actions, **kwargs):
+        playback_calls.append((record, kwargs))
+        assert len(frames) == len(actions) + 1
+        return original_playback(run, record, frames, actions, **kwargs)
+
+    def tracked(agent, reward, run_config, **kwargs):
+        before = tensor_hash(agent), tensor_hash(reward)
+        report = original_evaluate(agent, reward, run_config, **kwargs)
+        assert (tensor_hash(agent), tensor_hash(reward)) == before
+        reports.append((run_config.visual_config, report))
+        assert (kwargs.get("on_playback") is not None) == (len(reports) % 2 == 0)
+        return report
+
+    def env_factory(task, **kwargs):
+        env = AtomicEnv(task, **kwargs)
+        original_reset = env.reset
+
+        def reset(**reset_kwargs):
+            frame, info = original_reset(**reset_kwargs)
+            if kwargs["split"] == "validation" and kwargs.get("visual_config") is not None:
+                styles.append(info["presentation"]["pixel_style"])
+            return frame, info
+
+        env.reset = reset
+        return env
+
+    def write(path, value):
+        if path.name == "status.json":
+            phases.append(value["phase"])
+        return original_write(path, value)
+
+    def agent_factory(agent_config):
+        factories.append(True)
+        return factory(agent_config)
+
+    monkeypatch.setattr(sequence, "evaluate_sequence", tracked)
+    monkeypatch.setattr(sequence, "atomic_json", write)
+    monkeypatch.setattr(frozen_playback, "write_frozen_playback", playback)
+    output = tmp_path / "dual"
+    summary = train_sequence(cfg, output, agent_factory=agent_factory,
+                             env_factory=env_factory, reward=TinyReward())
+    assert factories == [True]
+    assert len(playback_calls) == len(cfg.tasks) * 3
+    assert len(list((output / "playbacks").glob("*.json"))) == len(playback_calls)
+    for record, options in playback_calls:
+        assert record["evaluation_pixel_art"] is True
+        assert record["policy"] == "frozen_deterministic"
+        assert options["epoch"] in (0, 2, 3)
+        if options["epoch"] == 2:
+            assert options["checkpoint"] is options["manifest"] is None
+        else:
+            assert options["manifest"]["agent_sha256"] == options["agent_sha256"]
+            assert options["manifest"]["weights_revision"] == options["weights_revision"]
+        assert options["evaluation_reference"].parent.name == "evaluations_pixel"
+    assert len(reports) == 6 and "pixel_evaluation" in phases
+    assert styles and set(styles) <= set(PIXEL_STYLE_SPLITS["validation"])
+    for index, rollout in enumerate((0, 2, 3)):
+        canonical = json.loads((output / "evaluations" / f"rollout_{rollout:04d}.json").read_text())
+        pixel_path = output / "evaluations_pixel" / f"rollout_{rollout:04d}.json"
+        pixel = json.loads(pixel_path.read_text())
+        assert reports[2 * index][0] == reports[2 * index + 1][0] == cfg.visual_config
+        assert canonical["agent_sha256"] == pixel["agent_sha256"]
+        assert canonical["reward_sha256"] == pixel["reward_sha256"]
+        assert canonical["protocol_sha256"] != pixel["protocol_sha256"]
+        assert canonical["rollout"] == pixel["rollout"] == rollout
+        assert pixel["evaluation_pixel_art"] is True
+        assert len(pixel["playback_records"]) == len(cfg.tasks)
+        assert pixel["evaluation_protocol"]["visual_config"]["pixel_art"] is True
+        assert pixel["evaluation_style_split"] == "validation"
+        assert "evaluation_pixel_art" not in canonical
+    latest = json.loads((output / "evaluation_pixel.json").read_text())
+    assert latest["rollout"] == latest["latest_checkpoint_rollout"] == 3
+    assert latest["current_policy_saved"] is True
+    assert summary["evaluation_pixel_summaries"] == latest["summaries"]
+    assert summary["evaluation_pixel_rollout"] == 3
+
+
+@pytest.mark.parametrize("mode", ["warm_preserve", "warm_reset", "resume"])
+def test_training_releases_loaded_checkpoint_payload_before_evaluation_and_collection(
+        tmp_path, monkeypatch, mode):
+    import carryrl.training.sequence as sequence
+
+    class TrackedPayload(dict):
+        pass
+
+    cfg = replace(config(), evaluate_initial=True)
+    parent = train_sequence(cfg, tmp_path / "parent", agent_factory=factory,
+                            reward=TinyReward(), reward_factory=TinyReward)
+    parent_checkpoint = Path(parent["latest_checkpoint"])
+    parent_manifest_bytes = (parent_checkpoint / "manifest.json").read_bytes()
+    parent_manifest = json.loads(parent_manifest_bytes)
+    parent_state = torch.load(parent_checkpoint / "state.pt", weights_only=True)
+    original_load = sequence.load_sequence_checkpoint
+    original_evaluate = sequence.evaluate_sequence
+    original_collect = sequence.collect_episode
+    payload_refs, weight_refs, reset_optimizer_refs, observations = [], [], [], []
+
+    def load(*args, **kwargs):
+        agent, optimizer, reward, saved = original_load(*args, **kwargs)
+        tracked = TrackedPayload(saved)
+        payload_refs.append(weakref.ref(tracked))
+        weight_refs.extend(weakref.ref(tensor) for section in ("agent_state", "reward_state")
+                           for tensor in tracked[section].values())
+        if mode == "warm_reset":
+            reset_optimizer_refs.extend(
+                weakref.ref(tensor) for values in tracked["optimizer_state"]["state"].values()
+                for tensor in values.values() if torch.is_tensor(tensor))
+        return agent, optimizer, reward, tracked
+
+    def assert_released(phase):
+        assert payload_refs and all(reference() is None for reference in payload_refs)
+        assert weight_refs and all(reference() is None for reference in weight_refs)
+        assert all(reference() is None for reference in reset_optimizer_refs)
+        observations.append(phase)
+
+    def evaluate(*args, **kwargs):
+        assert_released("evaluation")
+        return original_evaluate(*args, **kwargs)
+
+    def collect(*args, **kwargs):
+        assert_released("collection")
+        return original_collect(*args, **kwargs)
+
+    monkeypatch.setattr(sequence, "load_sequence_checkpoint", load)
+    monkeypatch.setattr(sequence, "evaluate_sequence", evaluate)
+    monkeypatch.setattr(sequence, "collect_episode", collect)
+    output = tmp_path / "child"
+    if mode == "resume":
+        child_config = replace(cfg, total_rollouts=2)
+        train_sequence(child_config, output, resume=parent_checkpoint,
+                       agent_factory=factory, reward_factory=TinyReward)
+        initial_rollout = 1
+    else:
+        child_config = replace(cfg, reset_optimizer_on_warm_start=mode == "warm_reset")
+        train_sequence(child_config, output, warm_start=parent_checkpoint,
+                       agent_factory=factory, reward_factory=TinyReward)
+        initial_rollout = 0
+    assert {"evaluation", "collection"} <= set(observations)
+    initial = output / "checkpoints" / f"rollout_{initial_rollout:04d}"
+    initial_manifest = json.loads((initial / "manifest.json").read_text())
+    assert initial_manifest["agent_sha256"] == parent_manifest["agent_sha256"]
+    assert initial_manifest["reward_sha256"] == parent_manifest["reward_sha256"]
+    assert (parent_checkpoint / "manifest.json").read_bytes() == parent_manifest_bytes
+    baseline = json.loads((output / "baseline.json").read_text())
+    assert baseline["agent_sha256"] == parent_manifest["agent_sha256"]
+    assert baseline["reward_sha256"] == parent_manifest["reward_sha256"]
+    initial_state = torch.load(initial / "state.pt", weights_only=True)
+    initial_moments = initial_state["optimizer_state"]["state"]
+    if mode == "warm_reset":
+        assert not initial_moments and reset_optimizer_refs
+    else:
+        parent_moments = parent_state["optimizer_state"]["state"]
+        assert parent_moments and initial_moments.keys() == parent_moments.keys()
+        for parameter, values in parent_moments.items():
+            assert all(torch.equal(value, initial_moments[parameter][name])
+                       for name, value in values.items())
+    # The public loader still returns complete payloads to callers that need them.
+    _, _, _, public_data = original_load(
+        parent_checkpoint, cfg, agent_factory=factory, reward_factory=TinyReward,
+        evaluation_only=True)
+    assert {"agent_state", "reward_state", "optimizer_state"} <= public_data.keys()
+
+
+@pytest.mark.parametrize("stop_after", [0, 1])
+def test_external_stop_saves_and_evaluates_completed_cycle_without_starting_another(
+        tmp_path, monkeypatch, stop_after):
+    import carryrl.training.sequence as sequence
+
+    completed, collected, requested = [], [], []
+    original_update, original_collect = sequence.update_ppo, sequence.collect_episode
+
+    def update(*args, **kwargs):
+        result = original_update(*args, **kwargs)
+        completed.append(result)
+        return result
+
+    def collect(*args, **kwargs):
+        collected.append(kwargs["task"])
+        return original_collect(*args, **kwargs)
+
+    def stop():
+        requested.append(len(completed))
+        return len(completed) >= stop_after
+
+    monkeypatch.setattr(sequence, "update_ppo", update)
+    monkeypatch.setattr(sequence, "collect_episode", collect)
+    cfg = replace(config(), total_rollouts=3, eval_every_rollouts=3,
+                  checkpoint_every_rollouts=3)
+    output = tmp_path / "stopped"
+    summary = train_sequence(cfg, output, agent_factory=factory, reward=TinyReward(),
+                             reward_factory=TinyReward, stop_requested=stop)
+    assert summary["status"] == "resource_stopped"
+    assert summary["stop_reason"] == "external_stop_requested"
+    assert summary["rollouts"] == summary["evaluation_rollout"] == stop_after
+    assert summary["optimizer_steps_this_process"] == stop_after
+    assert len(collected) == len(cfg.tasks) * stop_after
+    assert requested == list(range(stop_after + 1))
+    assert len(list((output / "trajectories").rglob("*.npz"))) == len(collected)
+    checkpoint = Path(summary["latest_checkpoint"])
+    assert checkpoint.name == f"rollout_{stop_after:04d}"
+    assert (checkpoint / "state.pt").is_file()
+    manifest = json.loads((checkpoint / "manifest.json").read_text())
+    evaluation = json.loads((output / "evaluation.json").read_text())
+    assert evaluation["rollout"] == evaluation["latest_checkpoint_rollout"] == stop_after
+    assert evaluation["weights_revision"] == manifest["weights_revision"] == stop_after
+    assert evaluation["agent_sha256"] == manifest["agent_sha256"]
+    assert evaluation["reward_sha256"] == manifest["reward_sha256"]
+    assert evaluation["current_policy_saved"] is True
+
+
+def test_false_external_stop_preserves_default_training_result(tmp_path):
+    cfg = config()
+    summaries = [train_sequence(
+        cfg, tmp_path / name, agent_factory=factory, reward=TinyReward(),
+        reward_factory=TinyReward, stop_requested=callback)
+        for name, callback in (("default", None), ("false", lambda: False))]
+    assert all(row["status"] == "completed" for row in summaries)
+    assert summaries[0]["evaluation_summaries"] == summaries[1]["evaluation_summaries"]
+    manifests = [json.loads((Path(row["latest_checkpoint"]) / "manifest.json").read_text())
+                 for row in summaries]
+    assert manifests[0]["agent_sha256"] == manifests[1]["agent_sha256"]
+    assert manifests[0]["reward_sha256"] == manifests[1]["reward_sha256"]
+
+
+@pytest.mark.parametrize("value", [None, 1, "stop", np.bool_(True)])
+def test_external_stop_callback_requires_actual_boolean(tmp_path, value):
+    output = tmp_path / "invalid-return"
+    with pytest.raises(ValueError, match="stop_requested must return a boolean"):
+        train_sequence(config(), output, agent_factory=factory, reward=TinyReward(),
+                       stop_requested=lambda: value)
+    assert not (output / "trajectories").exists()
+    assert json.loads((output / "status.json").read_text())["status"] == "failed"
+
+
+def test_external_stop_requires_callable_before_output_creation(tmp_path):
+    output = tmp_path / "invalid-callback"
+    with pytest.raises(ValueError, match="stop_requested must be callable"):
+        train_sequence(config(), output, stop_requested=True)
+    assert not output.exists()

@@ -189,16 +189,25 @@ def prepare_episodes(agent, episodes, advantages, returns, *, instruction_cache=
     return prepared
 
 
-def ppo_loss(policy, episodes, config):
-    """Whole-episode joint-action PPO objective and inspectable scalar diagnostics."""
+def ppo_loss(policy, episodes, config, *, normalization_counts=None, component=None):
+    """Whole-episode PPO, optionally contributing to a larger minibatch's objective.
+
+    Microbatches use the full minibatch's task transition counts so summing
+    their losses and gradients preserves both supported weighting conventions.
+    """
     import mlx.core as mx
 
-    counts = {}
-    for episode in episodes:
-        counts[episode["task"]] = counts.get(episode["task"], 0) + len(episode["actions"])
+    counts = normalization_counts
+    if counts is None:
+        counts = {}
+        for episode in episodes:
+            counts[episode["task"]] = counts.get(episode["task"], 0) + len(episode["actions"])
     total = sum(counts.values())
     metrics = dict.fromkeys(("policy_loss", "value_loss", "entropy", "approx_kl",
                             "clip_fraction"), 0.0)
+    metrics.update(_ratio_sum=mx.array(0.),
+                   _ratio_min=mx.array(float("inf")), _ratio_max=mx.array(0.),
+                   _log_ratio_abs_max=mx.array(0.))
     loss, valid = mx.array(0.0), mx.array(True)
     for episode in episodes:
         evaluated = policy.evaluate_episode(episode["patches"], episode["actions"],
@@ -218,22 +227,148 @@ def ppo_loss(policy, episodes, config):
         value_loss = 0.5 * mx.square(value - episode["target"])
         denominator = (len(counts) * counts[episode["task"]]
                        if config.ppo_task_balance else total)
-        loss = loss + mx.sum(policy_loss + config.value_coef * value_loss
-                             - config.entropy_coef * entropy) / denominator
+        combined = {"actor": policy_loss, "value": config.value_coef * value_loss,
+                    "entropy": -config.entropy_coef * entropy}
+        terms = sum(combined.values()) if component is None else combined[component]
+        weight = episode.get("objective_weight")
+        loss = loss + (mx.sum(terms) / denominator if weight is None else mx.sum(terms) * weight)
+        metrics["_ratio_sum"] += mx.sum(ratio)
+        metrics["_ratio_min"] = mx.minimum(metrics["_ratio_min"], mx.min(ratio))
+        metrics["_ratio_max"] = mx.maximum(metrics["_ratio_max"], mx.max(ratio))
+        metrics["_log_ratio_abs_max"] = mx.maximum(
+            metrics["_log_ratio_abs_max"], mx.max(mx.abs(log_ratio)))
         for name, values in (("policy_loss", policy_loss), ("value_loss", value_loss),
                              ("entropy", entropy), ("approx_kl", ratio - 1 - log_ratio),
                              ("clip_fraction", mx.abs(ratio - 1) > config.clip_range)):
-            metrics[name] = metrics[name] + mx.sum(values) / denominator
+            metrics[name] = metrics[name] + (mx.sum(values) / denominator if weight is None
+                                              else mx.sum(values) * weight)
     return loss, metrics, valid & mx.isfinite(loss)
 
 
-def update_ppo_mlx(agent, optimizer, episodes, config, *, backend=None):
+def _minibatch_gradients(agent, episodes, indices, advantages, returns, config, *,
+                        mx, loss_and_grad, counts, instruction_cache, episode_weights=None):
+    """Accumulate one objective while retaining only one episode chunk's graph."""
+    size = config.ppo_microbatch_episodes or len(indices)
+    gradients, diagnostics = None, None
+    has_instruction = has_memory_write = False
+    for start in range(0, len(indices), size):
+        selected = indices[start:start + size]
+        prepared = prepare_episodes(
+            agent, [episodes[index] for index in selected],
+            [advantages[index] for index in selected], [returns[index] for index in selected],
+            instruction_cache=instruction_cache)
+        if episode_weights is not None:
+            for index, episode in zip(selected, prepared, strict=True):
+                episode["objective_weight"] = episode_weights[index]
+        has_instruction |= any(episode["instruction_features"] is not None
+                               for episode in prepared)
+        has_memory_write |= any(len(episode["actions"]) > config.agent.segment_length
+                                for episode in prepared)
+        (loss, current, valid), chunk_gradients = loss_and_grad(prepared, counts)
+        mx.eval(loss, current, valid, chunk_gradients)
+        if not bool(valid):
+            raise FloatingPointError("nonfinite or invalid MLX PPO replay/loss")
+        if gradients is None:
+            gradients, diagnostics = chunk_gradients, current
+        else:
+            gradients = {"weights": {
+                name: gradient + chunk_gradients["weights"][name]
+                for name, gradient in gradients["weights"].items()}}
+            diagnostics = {
+                name: (mx.minimum(value, current[name]) if name == "_ratio_min" else
+                       mx.maximum(value, current[name]) if name in {
+                           "_ratio_max", "_log_ratio_abs_max"} else value + current[name])
+                for name, value in diagnostics.items()}
+
+        # Materialize the running sum as well as the chunk. Neither the replay
+        # graph nor a chain of lazy additions may span successive microbatches.
+        mx.eval(gradients, diagnostics)
+        del prepared, loss, current, valid, chunk_gradients
+    active = set(gradients["weights"])
+    if not has_instruction:
+        active.discard("instruction_projection.weight")
+    if not has_memory_write:
+        active.discard("temporal.write_tokens")
+    return {name: float(value) for name, value in diagnostics.items()}, gradients, active
+
+
+def _mlx_component_probe(agent, policy, episodes, indices, advantages, returns, weights, config,
+                         instruction_cache):
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from carryrl.training.ppo_diagnostics import preserve_rng
+
+    components = {}
+    combined = None
+    with preserve_rng(mx=mx):
+        for component in ("actor", "value", "entropy"):
+            accumulated = None
+            loss_and_grad = nn.value_and_grad(
+                policy, lambda prepared: ppo_loss(policy, prepared, config, component=component))
+            # One complete episode bounds all feature transfers and replay graphs.
+            for index, weight in zip(indices, weights, strict=True):
+                prepared = prepare_episodes(
+                    agent, [episodes[index]], [advantages[index]], [returns[index]],
+                    instruction_cache=instruction_cache)
+                prepared[0]["objective_weight"] = weight
+                (loss, _, valid), gradients = loss_and_grad(prepared)
+                mx.eval(loss, valid, gradients)
+                if not bool(valid):
+                    raise FloatingPointError("nonfinite MLX PPO gradient probe")
+                accumulated = gradients["weights"] if accumulated is None else {
+                    name: value + gradients["weights"][name] for name, value in accumulated.items()}
+                mx.eval(accumulated)
+                del prepared, loss, valid, gradients
+            norm = mx.sqrt(sum(mx.sum(mx.square(value)) for value in accumulated.values()))
+            mx.eval(norm)
+            components[component] = float(norm)
+            combined = accumulated if combined is None else {
+                name: value + accumulated[name] for name, value in combined.items()}
+            mx.eval(combined)
+        norm = mx.sqrt(sum(mx.sum(mx.square(value)) for value in combined.values()))
+        mx.eval(norm)
+        components["combined"] = float(norm)
+    return components
+
+
+def _mlx_post_update_kl(agent, policy, episodes, indices, advantages, returns, weights, config,
+                        instruction_cache):
+    import mlx.core as mx
+
+    from carryrl.training.ppo_diagnostics import preserve_rng
+
+    kl, mass = 0., 0.
+    with preserve_rng(mx=mx):
+        for index, weight in zip(indices, weights, strict=True):
+            prepared = prepare_episodes(
+                agent, [episodes[index]], [advantages[index]], [returns[index]],
+                instruction_cache=instruction_cache)
+            prepared[0]["objective_weight"] = weight
+            loss, metrics, valid = ppo_loss(policy, prepared, config)
+            mx.eval(loss, metrics, valid)
+            if not bool(valid):
+                raise FloatingPointError("nonfinite MLX PPO post-update probe")
+            kl += float(metrics["approx_kl"])
+            mass += len(episodes[index]) * weight
+            del prepared, loss, metrics, valid
+    return kl / mass if config.ppo_normalization == "rollout" else kl
+
+
+def update_ppo_mlx(agent, optimizer, episodes, config, *, backend=None, cycle: int = 1):
     require_mlx()
     import mlx.nn as nn
 
+    from carryrl.training.ppo_diagnostics import (
+        advantage_diagnostics,
+        objective_weights,
+        probe_due,
+        update_means,
+    )
     from carryrl.training.sequence import _episode_minibatches, _ppo_targets
 
     total, task_totals, advantages, returns = _ppo_targets(episodes, config)
+    diagnostics = advantage_diagnostics(episodes, config)
     backend = backend if backend is not None else MLXPPOBackend(agent, optimizer)
     if backend.agent is not agent or backend.optimizer.canonical is not optimizer:
         raise ValueError("MLX backend belongs to another policy or optimizer")
@@ -241,8 +376,11 @@ def update_ppo_mlx(agent, optimizer, episodes, config, *, backend=None):
     instruction_cache = {}
     _prepare_instructions(agent, episodes, instruction_cache)
     loss_and_grad = nn.value_and_grad(backend.policy,
-                                     lambda batch: ppo_loss(backend.policy, batch, config))
-    metrics, optimizer_steps = [], 0
+                                     lambda batch, counts: ppo_loss(
+                                         backend.policy, batch, config,
+                                         normalization_counts=counts))
+    metrics, updates, probes, optimizer_steps = [], [], [], 0
+    first_ratio = None
     task_weight_sums = dict.fromkeys(task_totals, 0.0)
     task_replays = dict.fromkeys(task_totals, 0)
     stopped = False
@@ -252,23 +390,34 @@ def update_ppo_mlx(agent, optimizer, episodes, config, *, backend=None):
             sums = dict.fromkeys(("policy_loss", "value_loss", "entropy", "approx_kl",
                                   "clip_fraction", "gradient_norm"), 0.0)
             observed_transitions = epoch_steps = observed_batches = 0
-            for indices in _episode_minibatches(episodes, config.ppo_minibatch_episodes,
-                                                config.ppo_task_balance):
-                batch_episodes = prepare_episodes(
-                    agent, [episodes[index] for index in indices],
-                    [advantages[index] for index in indices], [returns[index] for index in indices],
-                    instruction_cache=instruction_cache)
-                (loss, diagnostics, valid), gradients = loss_and_grad(batch_episodes)
-                mx.eval(loss, diagnostics, valid, gradients)
-                if not bool(valid):
-                    raise FloatingPointError("nonfinite or invalid MLX PPO replay/loss")
-                batch = {name: float(value) for name, value in diagnostics.items()}
-                counts = {}
-                for episode in batch_episodes:
-                    counts[episode["task"]] = (counts.get(episode["task"], 0)
-                                               + len(episode["actions"]))
-                del episode
+            epoch_updates = []
+            minibatches = _episode_minibatches(episodes, config.ppo_minibatch_episodes,
+                                              config.ppo_task_balance)
+            if config.ppo_normalization == "rollout":
+                for indices in minibatches:
+                    objective_weights(episodes, indices, config)
+            for batch_index, indices in enumerate(minibatches):
+                counts, weights, task_masses = objective_weights(episodes, indices, config)
+                episode_weights = dict(zip(indices, weights, strict=True)) \
+                    if config.ppo_normalization == "rollout" else None
+                batch, gradients, active = _minibatch_gradients(
+                    agent, episodes, indices, advantages, returns, config,
+                    mx=mx, loss_and_grad=loss_and_grad, counts=counts,
+                    instruction_cache=instruction_cache, episode_weights=episode_weights)
                 batch_total = sum(counts.values())
+                ratio_mean = batch.pop("_ratio_sum") / batch_total
+                ratio_statistics = {
+                    "mean": ratio_mean,
+                    "min": batch.pop("_ratio_min"), "max": batch.pop("_ratio_max"),
+                    "log_ratio_abs_max": batch.pop("_log_ratio_abs_max"),
+                    "transitions": batch_total, "scope": "selected transitions before update",
+                }
+                if first_ratio is None:
+                    first_ratio = ratio_statistics
+                objective_mass = sum(task_masses.values())
+                if config.ppo_normalization == "rollout":
+                    batch["approx_kl"] /= objective_mass
+                    batch["clip_fraction"] /= objective_mass
                 observed_batches += 1
                 observed_transitions += batch_total
                 for name in batch:
@@ -276,29 +425,41 @@ def update_ppo_mlx(agent, optimizer, episodes, config, *, backend=None):
                 # Reject before any moments, counters, decay or policy mutation.
                 if config.target_kl > 0 and batch["approx_kl"] > config.target_kl:
                     stopped = True
-                    del batch_episodes, loss, diagnostics, valid, gradients
+                    del gradients
                     break
-                active = set(gradients["weights"])
-                if not any(episode["instruction_features"] is not None
-                           for episode in batch_episodes):
-                    active.discard("instruction_projection.weight")
-                if not any(len(episode["actions"]) > config.agent.segment_length
-                           for episode in batch_episodes):
-                    active.discard("temporal.write_tokens")
+                do_probe = epoch == 0 and batch_index == 0 and probe_due(config, cycle)
+                components = (_mlx_component_probe(
+                    agent, backend.policy, episodes, indices, advantages, returns, weights,
+                    config, instruction_cache) if do_probe else None)
                 gradient_norm = backend.apply_gradients(gradients, config.max_grad_norm,
                                                         active_names=active)
                 optimizer_steps += 1
                 epoch_steps += 1
                 for task, count in counts.items():
-                    task_weight_sums[task] += (1 / len(counts) if config.ppo_task_balance
-                                              else count / batch_total)
+                    task_weight_sums[task] += task_masses[task]
                     task_replays[task] += count
                 sums["gradient_norm"] += gradient_norm * batch_total
-                # Drop evaluated graph/input references before allocating the next
-                # batch, including the final batch before the Torch export boundary.
-                del batch_episodes, loss, diagnostics, valid, gradients
+                record = {"epoch": epoch, "minibatch": batch_index, "update": optimizer_steps,
+                          **batch, "gradient_norm": gradient_norm,
+                          "clip_coefficient": min(
+                              1., config.max_grad_norm / (gradient_norm + 1e-6)),
+                          "ratio": ratio_statistics, "task_loss_weights": task_masses,
+                          "objective_mass": objective_mass}
+                updates.append(record)
+                epoch_updates.append(record)
+                if do_probe:
+                    probes.append({"cycle": cycle, "update": optimizer_steps,
+                                   "component_gradient_norms": components,
+                                   "gradient_norm": gradient_norm,
+                                   "clip_coefficient": record["clip_coefficient"],
+                                   "pre_update_kl": batch["approx_kl"],
+                                   "post_update_kl": _mlx_post_update_kl(
+                                       agent, backend.policy, episodes, indices, advantages,
+                                       returns, weights, config, instruction_cache)})
+                del gradients
             metrics.append({"epoch": epoch,
                             **{name: value / observed_transitions for name, value in sums.items()},
+                            **update_means(epoch_updates),
                             "optimizer_steps": epoch_steps, "minibatches": observed_batches,
                             "replayed_transitions": observed_transitions,
                             "kl_early_stop": stopped})
@@ -310,12 +471,16 @@ def update_ppo_mlx(agent, optimizer, episodes, config, *, backend=None):
     return {"valid_transitions": total, "episodes": len(episodes), "epochs": metrics,
             "optimizer_steps": optimizer_steps, "kl_early_stop": stopped,
             "training_backend": "mlx", "trainable_device": "Metal GPU",
-            "task_transitions": task_totals,
+            "task_transitions": task_totals, "updates": updates,
+            "first_minibatch_ratio": first_ratio, "gradient_probes": probes,
+            "advantage_diagnostics": diagnostics, "ppo_normalization": config.ppo_normalization,
             "optimizer_task_loss_weights": {
                 task: weight / optimizer_steps for task, weight in task_weight_sums.items()
             } if optimizer_steps else None,
             "optimizer_task_loss_weights_scope": "mean objective coefficients over applied "
             "optimizer steps; excludes rejected KL minibatches; not gradient attribution",
             "optimizer_task_transition_replays": task_replays,
-            "loss_weighting": "equal task mean per minibatch" if config.ppo_task_balance
-                              else "valid transitions per minibatch"}
+            "loss_weighting": ("equal task rollout mean with episode selection correction"
+                               if config.ppo_normalization == "rollout" else
+                               "equal task mean per minibatch" if config.ppo_task_balance else
+                               "valid transitions per minibatch")}

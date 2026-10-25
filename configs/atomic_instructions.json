@@ -1,66 +1,66 @@
 {
   "navigation": [
-    "Доберись до зелёного выхода в лабиринте, обходя стены. Двигайся клавишами WASD или стрелками.",
-    "Reach the green exit through the maze. Use WASD or arrow keys to move; walls block movement."
+    "Доберись до зелёного выхода в лабиринте, обходя стены. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Reach the green exit through the maze. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Walls block movement. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "reaction": [
-    "Подставляй платформу под падающий мяч, чтобы поймать его. A и D или стрелки влево и вправо двигают платформу. Не пропускай мяч.",
-    "Catch the falling ball with the paddle. Move the paddle left and right with A/D or arrow keys. Avoid missing the ball."
+    "Подставляй платформу под падающий мяч, чтобы поймать его. Для движения платформы удерживай нужную клавишу A/D или стрелку влево/вправо; удержание повторяет движение каждый такт до отпускания. Не пропускай мяч. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Catch the falling ball with the paddle. Hold the desired A/D or left/right arrow key to move the paddle left and right; holding repeats movement each interval until release. Avoid missing the ball. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "mouse": [
-    "Наведи игровой курсор на круглую цель и нажми левую кнопку мыши. Движение мыши двигает курсор. Отпускай кнопку между кликами; попадания открывают следующие цели.",
-    "Move the cursor onto the round target, then click the left mouse button. Release the button between clicks. Hit each target that appears."
+    "Наведи игровой курсор на круглую цель и нажми левую кнопку мыши. Движение мыши двигает курсор. Отпускай кнопку между кликами; попадания открывают следующие цели. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Move the mouse to place the cursor onto the round target, then click the left mouse button. Release the button between clicks. Hit each target that appears. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "memory": [
-    "Запомни дверь, подсвеченную в начале. Пока написано Wait, движение заблокировано. Когда появится Choose, выбери запомненную дверь клавишами A/D или стрелками влево/вправо.",
-    "Remember which door is highlighted at the start. Movement is blocked during Wait. At Choose, move to that remembered door using A/D or left/right arrows."
+    "Запомни дверь, подсвеченную в начале. Пока написано Wait, движение заблокировано. Когда появится Choose, двигайся к запомненной двери, удерживая нужную клавишу A/D или стрелку влево/вправо; удержание повторяет движение каждый такт до отпускания. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Remember which door is highlighted at the start. Movement is blocked during Wait. At Choose, hold the desired A/D or left/right arrow key to move to that remembered door; holding repeats movement each interval until release. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "timing": [
-    "Пролетай через просветы движущихся препятствий. Короткое нажатие пробела подбрасывает персонажа. Отпускай пробел перед следующим взмахом; не касайся препятствий и границ.",
-    "Fly through the gaps in moving obstacles. Tap Space to flap upward and release it before the next flap. Avoid obstacles and screen boundaries."
+    "Пролетай через просветы движущихся препятствий. Короткое нажатие пробела подбрасывает персонажа. Отпускай пробел перед следующим взмахом; не касайся препятствий и границ. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Fly through the gaps in moving obstacles. Tap Space to flap upward and release it before the next flap. Avoid obstacles and screen boundaries. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "platforming": [
-    "Доберись до флажка справа, перепрыгивая препятствия. A/D или стрелки влево/вправо двигают персонажа. Пробел запускает прыжок с земли; отпускай его между прыжками.",
-    "Reach the flag on the right by jumping over obstacles. Move with A/D or left/right arrows. Tap Space while on the ground to jump, then release it."
+    "Доберись до флажка справа, перепрыгивая препятствия. Для движения персонажа удерживай нужную клавишу A/D или стрелку влево/вправо; удержание повторяет движение каждый такт до отпускания. Пробел запускает прыжок с земли; отпускай его между прыжками. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Reach the flag on the right by jumping over obstacles. Hold the desired A/D or left/right arrow key to move; holding repeats movement each interval until release. Tap Space while on the ground to jump, then release it. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "steering": [
-    "Доедь до конца извилистой дороги, удерживая машинку на ней. Машинка едет вперёд сама. A/D или стрелки влево/вправо управляют рулём; учитывай инерцию.",
-    "Stay on the winding road until the finish. Forward motion is automatic. Steer with A/D or left/right arrows and account for steering inertia."
+    "Доедь до конца извилистой дороги, удерживая машинку на ней. Машинка едет вперёд сама. Для управления рулём удерживай нужную клавишу A/D или стрелку влево/вправо; удержание повторяет руление каждый такт до отпускания. Учитывай инерцию. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Stay on the winding road until the finish. Forward motion is automatic. Hold the desired A/D or left/right arrow key to steer; holding repeats steering each interval until release. Account for steering inertia. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "camera": [
-    "Подойди к двери и выровняй камеру так, чтобы дверь оказалась по центру. WASD перемещают тебя, мышь поворачивает и наклоняет камеру. Одного поворота камеры недостаточно: нужно подойти.",
-    "Approach the door and center it in the camera view. WASD controls movement and the mouse controls camera yaw and pitch. Turning alone is insufficient; move close to the door."
+    "Подойди к двери и выровняй камеру так, чтобы дверь оказалась по центру. Для перемещения удерживай нужную клавишу WASD или стрелку; удержание повторяет перемещение каждый такт до отпускания. Движение мыши поворачивает и наклоняет камеру. Одного поворота камеры недостаточно: нужно подойти. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Approach the door and center it in the camera view. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Mouse movement controls camera yaw and pitch. Turning alone is insufficient; move close to the door. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "interaction": [
-    "Подойди к предмету, нажми E, затем отнеси его к площадке и снова нажми E. Движение — WASD или стрелки. Отпускай E между взаимодействиями.",
-    "Move to the item and press E to pick it up, then move to the use area and press E again. Move with WASD or arrows; release E between interactions."
+    "Подойди к предмету, нажми E, затем отнеси его к площадке и снова нажми E. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Отпускай E между взаимодействиями. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Move to the item and press E to pick it up, then move to the use area and press E again. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Release E between interactions. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "causality": [
-    "Подойди к кнопке и нажми E, чтобы открыть дверь. Затем пройди к выходу через открытый проход. Движение — WASD или стрелки; избегай красной опасной клетки.",
-    "Approach the button and press E to open the door. Then go through the passage to the exit. Move with WASD or arrows and avoid the red hazard."
+    "Подойди к кнопке и нажми E, чтобы открыть дверь; отпусти E перед новым нажатием. Затем пройди к выходу через открытый проход. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Избегай красной опасной клетки. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Approach the button and press E to open the door; release E before another press. Then go through the passage to the exit. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Avoid the red hazard. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "key_door": [
-    "Найди ключ и подбери его нажатием E рядом с ним. Вернись к двери, отпусти и снова нажми E, затем дойди до выхода. Движение — WASD или стрелки.",
-    "Find the key and press E near it to pick it up. Return to the door, release and press E again to unlock it, then reach the exit. Move with WASD or arrows."
+    "Найди ключ и подбери его нажатием E рядом с ним. Вернись к двери, отпусти и снова нажми E, затем дойди до выхода. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Find the key and press E near it to pick it up. Return to the door, release and press E again to unlock it, then reach the exit. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "goal_choice": [
-    "Выбери цель с учётом награды и риска. Белые точки рядом с целями показывают их ценность. Двигайся WASD или стрелками и избегай охранника.",
-    "Choose a goal based on its reward and risk. White dots next to goals show their value. Move with WASD or arrow keys and avoid the guard."
+    "Выбери цель с учётом награды и риска. Белые точки рядом с целями показывают их ценность. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Избегай охранника. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Choose a goal based on its reward and risk. White dots next to goals show their value. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Avoid the guard. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "hazards": [
-    "Дойди до выхода, обходя ловушки и патрулирующего врага. WASD или стрелки управляют движением. Контакт с красными клетками или врагом завершает игру поражением.",
-    "Reach the exit while avoiding traps and the patrolling enemy. Move with WASD or arrows. Touching a red trap or the enemy causes failure."
+    "Дойди до выхода, обходя ловушки и патрулирующего врага. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Контакт с красными клетками или врагом завершает игру поражением. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Reach the exit while avoiding traps and the patrolling enemy. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Touching a red trap or the enemy causes failure. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "shooting": [
-    "Подойди к врагу на расстояние выстрела, наведи прицел и стреляй левой кнопкой мыши. WASD — движение, мышь — прицел. Число промахов ограничено; отпускай кнопку между выстрелами.",
-    "Move within firing range of the enemy, aim with the mouse, and fire with the left mouse button. WASD moves you. Misses are limited; release the button between shots."
+    "Подойди к врагу на расстояние выстрела, наведи прицел и стреляй левой кнопкой мыши. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Движение мыши управляет прицелом. Число промахов ограничено; отпускай кнопку между выстрелами. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Move within firing range of the enemy, aim with the mouse, and fire with the left mouse button. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Mouse movement controls aim. Misses are limited; release the button between shots. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ],
   "ui": [
-    "Нажми Tab, чтобы открыть инвентарь. Стрелками выбери предмет цвета образца над меню, нажми Enter для подтверждения и Escape для закрытия. Отпускай клавиши между нажатиями.",
-    "Press Tab to open the inventory. Use arrow keys to select the item matching the color sample above the menu, press Enter to confirm, then Escape to close. Release keys between presses."
+    "Нажми Tab, чтобы открыть инвентарь. В горизонтальном меню выбирай предмет клавишами A/D или стрелками влево/вправо, в вертикальном — W/S или стрелками вверх/вниз. Удержание повторяет перемещение выбора каждый такт. Выбери предмет цвета образца над меню, нажми Enter для подтверждения и Escape для закрытия. Отпускай Tab, Enter и Escape между нажатиями. Это полный список доступного управления; остальные клавиши, кнопки мыши, движение мыши и колесо не поддерживаются.",
+    "Press Tab to open the inventory. In a horizontal menu select with A/D or left/right arrows; in a vertical menu use W/S or up/down arrows. Holding a direction repeats selection movement each interval. Select the item matching the color sample above the menu, press Enter to confirm, then Escape to close. Release Tab, Enter and Escape between presses. This is the complete list of available controls; all other keys, mouse buttons, mouse motion, and the wheel are unsupported."
   ],
   "chain": [
-    "Выполни цепочку: подбери ключ, включи переключатель, открой дверь и дойди до выхода. WASD или стрелки — движение. Нажимай и отпускай E рядом с каждым объектом. Избегай опасностей.",
-    "Complete the sequence: collect the key, activate the switch, open the door, then reach the exit. Move with WASD or arrows; press and release E near each object. Avoid hazards."
+    "Выполни цепочку: подбери ключ, включи переключатель, открой дверь и дойди до выхода. Для движения удерживай нужную клавишу WASD или стрелку; удержание повторяет движение каждый такт до отпускания. Нажимай и отпускай E рядом с каждым объектом. Избегай опасностей. Это полный список доступного управления; остальные клавиши, кнопки и колесо не поддерживаются.",
+    "Complete the sequence: collect the key, activate the switch, open the door, then reach the exit. Hold the desired WASD or arrow key to move; holding repeats movement each interval until release. Press and release E near each object. Avoid hazards. This is the complete list of available controls; all other keys, buttons, and the wheel are unsupported."
   ]
 }
